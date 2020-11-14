@@ -1,0 +1,28 @@
+syntax = "proto3";
+package proto;
+
+message SignInRequest {
+  string mail = 1;
+  string password = 2;
+  string accessToken = 3;
+}
+
+message SignInResponse {
+  string access_token = 3;
+}
+
+message SignUpRequest {
+  string mail = 1;
+  string username = 2;
+  string password = 3;
+}
+
+message SignUpResponse {
+  bool ok = 1;
+}
+
+
+service AuthService {
+  rpc SignIn(SignInRequest) returns (SignInResponse);
+  rpc SignUp(SignUpRequest) returns (SignUpResponse);
+}
