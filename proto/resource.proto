@@ -1,0 +1,35 @@
+syntax = "proto3";
+package proto;
+
+message AllocRequestDescription {
+  repeated ContainerResource descriptions = 1;
+}
+
+message AllocationResponse {
+  repeated Result results = 1;
+}
+
+message ContainerResource {
+  bool type = 1;
+  int32 cpu = 2;
+  int32 memory_in_mb = 3;
+  int32 ephemeral_storage_in_gb = 4;
+  string persistent_volume_claim_code = 5;
+  repeated HostAlias host_aliases = 6;
+  string image = 7;
+  //string token;
+}
+
+message HostAlias {
+  string ip_address = 1;
+  repeated string host_names = 2;
+}
+
+message Result {
+  bool ok = 1;
+  string additional = 2;
+}
+
+service KauloudManagementService {
+  rpc AllocationRequest(AllocRequestDescription) returns (AllocationResponse);
+}
