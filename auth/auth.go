@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/go-redis/redis/v8"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	pb "github.com/xjayleex/kauloud/proto"
 	"golang.org/x/crypto/bcrypt"
@@ -17,6 +18,8 @@ import (
 	"sync"
 	"time"
 )
+
+// Implemented Server Interface.
 type AuthGRPC struct {
 	Server *grpc.Server
 	*AuthServer
@@ -28,8 +31,6 @@ func NewAuthGRPC (gs *grpc.Server,auth *AuthServer) *AuthGRPC {
 		AuthServer: auth,
 	}
 }
-
-// Implemented Server Interface.
 
 func (ag *AuthGRPC) Serve(addr string) error {
 	lis, err := net.Listen("tcp", addr)
@@ -58,19 +59,46 @@ func (ag *AuthGRPC) SignUp (ctx context.Context, req *pb.SignUpRequest) (*pb.Sig
 	if ag == nil {
 		return nil, errors.New("Err : There is no auth server objects.")
 	}
+	if req.GetId() == "" || req.GetUsername() == "" || req.GetMail() == "" || req.GetPassword() == "" {
+		return nil, errors.New("malformed request")
+	}
+	claim := &Candidate{
+		Id:      req.GetId(),
+		Name:    req.GetUsername(),
+		Mail:    req.GetMail(),
+	}
+	has, err := ag.candidateStore.Has(claim)
+	if err != nil {
+		return nil, errors.New("unknown error on checking candidate db")
+	} else {
+		if !has {
+			return nil, errors.New("claim is not verified")
+		}
+		if claim.Registered {
+			return nil, errors.New("registered already")
+		}
+	}
 
-	user, err := NewUser(req.GetId(), req.GetUsername(), req.GetPassword())
+
+	user, err := NewUser(req.GetId(), req.GetUsername(), req.GetPassword(), req.GetMail())
+	if err != nil {
+		ag.Logger().Debug(err)
+		return &pb.SignUpResponse{Ok: false}, err
+	}
+
+	err = ag.UserStore().Save(user)
 
 	if err != nil {
 		ag.Logger().Debug(err)
 		return &pb.SignUpResponse{Ok: false}, err
 	}
 
-	ag.UserStore().Save(user)
+	claim.Registered = true
 
-	if err != nil {
-		ag.Logger().Debug(err)
-		return &pb.SignUpResponse{Ok: false}, err
+	if updated, err := ag.candidateStore.Engine().Id(claim.Id).Cols("registered").Update(claim); err != nil || updated != 1 {
+		ag.Logger().Warnf("Problem on updating `register` column. Relevant user is %s", claim.String())
+	} else {
+		ag.Logger().Infof("Successfully registered new user : %s", claim.String())
 	}
 
 	return &pb.SignUpResponse{Ok: true}, nil
@@ -102,14 +130,15 @@ func (ag *AuthGRPC) SignIn (ctx context.Context, req *pb.SignInRequest) (*pb.Sig
 }
 
 type AuthServer struct {
+	candidateStore *CandidateStore
 	userStore UserStore
 	jwtManager *JWTManager
 	logger	*logrus.Logger
 }
 
-func NewAuthServer (userStore UserStore, jwtManager *JWTManager) *AuthServer {
-
+func NewAuthServer (candidateStore *CandidateStore, userStore UserStore, jwtManager *JWTManager) *AuthServer {
 	return &AuthServer{
+		candidateStore: candidateStore,
 		userStore: userStore,
 		jwtManager: jwtManager,
 		logger: logrus.New(),
@@ -117,6 +146,9 @@ func NewAuthServer (userStore UserStore, jwtManager *JWTManager) *AuthServer {
 }
 
 // Getter
+func (as *AuthServer) CandidateStore() *CandidateStore {
+	return as.candidateStore
+}
 
 func (as *AuthServer) UserStore() UserStore {
 	return as.userStore
@@ -145,19 +177,17 @@ func (as *AuthServer) SetUpDevLogger() {
 // 							 -> 2. token expired. or no token. (gRPC handle)
 func (as *AuthServer) verifyTokenInterceptor (ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	r, ok := req.(*pb.SignInRequest)
-	fmt.Println("Intercepted.")
 	if ok && r.GetAccessToken() != "" {
-		_, err := as.JwtManager().Verify(r.AccessToken)
+		_, err := as.JwtManager().VerifyToken(r.AccessToken)
 		if err == nil {
 			return nil, errors.New("Token not expired, yet")
 		} else {
-			fmt.Println("foobaryer")
 		}
 	}
 
-	as.Logger().Debugf("%s : Before Server call.",time.Now())
+	//as.Logger().Debugf("%s : Before Server call.",time.Now())
 	h, err := handler(ctx, req)
-	as.Logger().Debugf("%s : After Server call.",time.Now())
+	//as.Logger().Debugf("%s : After Server call.",time.Now())
 	return h, err
 }
 
@@ -185,13 +215,13 @@ func (manager *JWTManager) Generate(user User) (string, error) {
 		StandardClaims: jwt.StandardClaims{
 			ExpiresAt: time.Now().Add(manager.tokenDuration).Unix(),
 		},
-		Id: user.Id(),
+		Id: user.ID(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256,claims)
 	return token.SignedString([]byte(manager.secretKey))
 }
 
-func (manager *JWTManager) Verify(accessToken string) (*UserClaims, error) {
+func (manager *JWTManager) VerifyToken(accessToken string) (*UserClaims, error) {
 	token, err := jwt.ParseWithClaims(
 		accessToken,
 		&UserClaims{},
@@ -213,47 +243,95 @@ func (manager *JWTManager) Verify(accessToken string) (*UserClaims, error) {
 	return claims, nil
 }
 
+type CandidateStore struct {
+	RDBStore
+	// CandidateInfo 어디다 넣어야할까.. ? 일단 따로 빼는게 맞는
+}
+
+func NewCandidateStore (store RDBStore) *CandidateStore {
+	return &CandidateStore{
+		RDBStore: store,
+	}
+}
+
+func (cs *CandidateStore) Has(candidate *Candidate) (has bool, err error){
+	if cs.Engine() == nil {
+		return false, errors.New("nil db engine.")
+	}
+	if tableExists, err := cs.Engine().IsTableExist(Candidate{}); err != nil {
+		return false, err
+	} else {
+		if !tableExists {
+			return false, errors.New("table does not exists")
+		}
+	}
+
+	has, err = cs.Engine().Get(candidate)
+
+	return has, err
+}
+
+// Never, touch this `Candidate` type code, ever, ever ,ever ...
+type Candidate struct {
+	Id string		`json:"id" xorm:"Varchar(255) not null pk 'id' comment('StudentCode')"`
+	Name string		`json:"name" xorm:"Varchar(255) not null 'name'"`
+	Mail string		`json:"mail" xorm:"Varchar(255) not null 'mail'"`
+	Registered bool		`xorm:"Bool not null 'registered'" exception:"true"`
+	Created time.Time	`xorm:"created" exception:"true"`
+}
+
+func (candidate *Candidate) String() string {
+	return fmt.Sprintf("%s %s %s\n",candidate.Id, candidate.Name, candidate.Mail)
+}
+
 type User interface {
 	// user struct must implement `User` Interface and Some `Store` Interface.
 	// and, must add tags on the fields.
 	encoding.BinaryMarshaler // must implement MarshalBinary
 	encoding.BinaryUnmarshaler // must implement UnmarshalBinary
 	IsCorrectPassword(password string) bool
-	Id() string
-	HashedPassword() string
+	ID() string
+	HASHEDPASSWORD() string
+	MAIL() string
 }
-
 
 type user struct {
-	ID					string	`json:"id"`
-	USERNAME			string	`json:"username"`
-	HASHEDPASSWORD		string	`json:"password"`
+	Id					string	`json:"id" xorm:"Varchar(255) not null pk 'id' comment('StudentCode')"`
+	Username			string	`json:"username" xorm:"Varchar(255) not null 'username'"`
+	Hashedpassword		string	`json:"password" xorm:"Varchar(255) not null 'hashedpassword'"`
+	Mail				string	`json:"mail" xorm:"Varchar(255) not null 'mail'"`
+	Created				time.Time	`xorm:"created"`
 }
 
-func NewUser(id string, username string, pwd string) (*user, error ) {
+func NewUser(id string, username string, pwd string, mail string) (*user, error ) {
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, errors.New("Cannot Hash.")
 	}
 
 	user := &user{
-		USERNAME: username,
-		ID: id,
-		HASHEDPASSWORD: string(hashedPassword),
+		Id: id,
+		Username: username,
+		Hashedpassword: string(hashedPassword),
+		Mail: mail,
 	}
 	return user, nil
 }
 
-func (u *user) Id() string {
-	return u.ID
+func (u *user) ID() string {
+	return u.Id
 }
 
-func (u *user) Username() string {
-	return u.USERNAME
+func (u *user) USERNAME() string {
+	return u.Username
 }
 
-func (u *user) HashedPassword() string {
-	return u.HASHEDPASSWORD
+func (u *user) HASHEDPASSWORD() string {
+	return u.Hashedpassword
+}
+
+func (u *user) MAIL() string {
+	return u.Mail
 }
 
 func (u *user) MarshalBinary() ([]byte, error) {
@@ -265,12 +343,12 @@ func (u *user) UnmarshalBinary(data []byte) error {
 }
 
 func (u *user) IsCorrectPassword(password string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(u.HashedPassword()), []byte(password))
+	err := bcrypt.CompareHashAndPassword([]byte(u.HASHEDPASSWORD()), []byte(password))
 	return err == nil
 }
 
 func (u *user) Key() string {
-	return u.Id()
+	return u.ID()
 }
 
 func (u *user) Value() interface{} {
@@ -286,7 +364,7 @@ func NewRedisUserData (user User) *RedisUserData {
 }
 
 func (rud *RedisUserData) Key() string {
-	return rud.user.Id()
+	return rud.user.ID()
 }
 
 func (rud *RedisUserData) Value() RedisValue {
@@ -296,6 +374,35 @@ func (rud *RedisUserData) Value() RedisValue {
 type UserStore interface {
 	Save(user User) error
 	FindByKey(string) (User, error)
+}
+
+// for mysql or postre, etc...
+type RDBUserStore struct {
+	RDBStore
+}
+
+func NewRDBUserStore (store RDBStore) *RDBUserStore {
+	return &RDBUserStore{RDBStore: store}
+}
+
+func (rdbus *RDBUserStore) Save(user User) error {
+	_, err := rdbus.Engine().InsertOne(user)
+	return err
+}
+
+func (rdbus *RDBUserStore) FindByKey(key string) (User, error){
+	userClaimBean := &user{
+		Id:             key,
+	}
+	if has, err := rdbus.Engine().Get(userClaimBean); err != nil {
+		return nil, err
+	} else {
+		if has {
+			return userClaimBean, nil
+		} else {
+			return nil, errors.New("no matched item.")
+		}
+	}
 }
 
 type RedisUserStore struct {
@@ -313,20 +420,20 @@ func NewRedisUserStore (opts *redis.Options) (*RedisUserStore, error) {
 	}, nil
 }
 
-func (rs *RedisUserStore) Save (user User) error {
-	rs.mtx.Lock()
-	defer rs.mtx.Unlock()
+func (rus *RedisUserStore) Save (user User) error {
+	rus.mtx.Lock()
+	defer rus.mtx.Unlock()
 	ruser := NewRedisUserData(user)
-	if err := rs.setNX(ruser); err != nil {
+	if err := rus.setNX(ruser); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (rs *RedisUserStore) FindByKey(key string) (User, error) {
-	rs.mtx.RLock()
-	defer rs.mtx.RUnlock()
-	rCmd, err := rs.get(key)
+func (rus *RedisUserStore) FindByKey(key string) (User, error) {
+	rus.mtx.RLock()
+	defer rus.mtx.RUnlock()
+	rCmd, err := rus.get(key)
 	if err != nil {
 		return nil, err
 	}
