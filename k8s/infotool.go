@@ -1,4 +1,4 @@
-package k8s
+package main
 
 import (
 	"errors"
@@ -12,24 +12,50 @@ import (
 
 type ClusterResourceDescriber struct {
 	nodeLists   *corev1.NodeList
-	cliset      *clientset.Clientset
+	clientset   *clientset.Clientset
 	reqs        map[corev1.ResourceName]resource.Quantity
 	limits      map[corev1.ResourceName]resource.Quantity
 	allocatable map[corev1.ResourceName]resource.Quantity
+
+	r			ResourceMap
+	l			ResourceMap
+	a			ResourceMap
+}
+type ResourceMap struct {
+	PerNode map[string]map[corev1.ResourceName]resource.Quantity
+	Total   map[corev1.ResourceName]resource.Quantity
 }
 
-func NewClusterResourceDescriber (kcli *KubeClient) *ClusterResourceDescriber {
+func NewResourceMap (nodes *corev1.NodeList) *ResourceMap {
+	perNode := make(map[string]map[corev1.ResourceName]resource.Quantity)
+	for _, node := range nodes.Items {
+		perNode[node.Name] = make(map[corev1.ResourceName]resource.Quantity)
+	}
+	total := make(map[corev1.ResourceName]resource.Quantity)
+	return &ResourceMap{
+		PerNode: perNode,
+		Total:   total,
+	}
+}
+
+func (rm *ResourceMap) Add() {
+	// rm.Pernode에
+}
+func (rm *ResourceMap) Sub() {}
+func (rm *ResourceMap) RefByKey() {}
+
+func NewClusterResourceDescriber (client *KubeClient) *ClusterResourceDescriber {
 	return &ClusterResourceDescriber{
-		cliset: kcli.Clientset(),
+		clientset: client.Clientset(),
 	}
 }
 
 func (crd *ClusterResourceDescriber) UpdatedNodeList (ctx context.Context) (*corev1.NodeList, error) {
-	if crd.cliset == nil {
-		return nil, errors.New("cliset nil error")
+	if crd.clientset == nil {
+		return nil, errors.New("clientset nil error")
 	}
 
-	nodes, err := crd.cliset.CoreV1().Nodes().List(ctx,  metav1.ListOptions{})
+	nodes, err := crd.clientset.CoreV1().Nodes().List(ctx,  metav1.ListOptions{})
 	return nodes, err
 }
 
@@ -72,14 +98,30 @@ func (crd *ClusterResourceDescriber) Allocatable() (corev1.ResourceList, error) 
 
 // Always makes network requests.
 func (crd *ClusterResourceDescriber) getPodsList (ctx context.Context, namespace string, selector fields.Selector) (*PodsList, error) {
-	podsList, err := crd.cliset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{FieldSelector: selector.String()})
+	podsList, err := crd.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{FieldSelector: selector.String()})
 	if err != nil {
 		return nil, err
 	}
 	return &PodsList{podsList} , err
 }
+//
+//
+// Describe each node
+// 		nodeA  nodeB  nodeC
+// cpu  1000m  2000m  2000m
+// gpu    1      0      2
+// mem
+//        \      |      /
+//         \     |     /
+//		    \    |    /
+//           \   |   /
+//            \  |  /
+//    map describing all node
+// cpu           5
+// gpu           3
+// mem ~~~~~~~~~~~~~~~~~~~~
 
-func (crd *ClusterResourceDescriber) DescribeAllNode (ctx context.Context, namespace string) (interface{}, error) {
+func (crd *ClusterResourceDescriber) DescribeAllNodes (ctx context.Context, namespace string) (interface{}, error) {
 	allSelector, err := nodeParseSelector("")
 	if err != nil {
 		return nil, err
@@ -89,8 +131,18 @@ func (crd *ClusterResourceDescriber) DescribeAllNode (ctx context.Context, names
 	if err != nil {
 		return nil, err
 	}
+
+	// for each node -> compute Allocatable
+	nodes, err := crd.NodeList()
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range nodes.Items {
+
+	}
 	crd.reqs, crd.limits = podsList.describe()
 }
+
 
 type PodsList struct {
 	*corev1.PodList
