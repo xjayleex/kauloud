@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding"
+	"encoding/json"
 	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"sync"
 	"time"
 )
 
@@ -141,4 +143,64 @@ func (rc *RedisClient) get(key string) (*redis.StringCmd, error) {
 }
 
 
-// mysql
+
+type RedisUserData struct {
+	user User
+}
+
+func NewRedisUserData (user User) *RedisUserData {
+	return &RedisUserData{user: user}
+}
+
+func (rud *RedisUserData) Key() string {
+	return rud.user.ID()
+}
+
+func (rud *RedisUserData) Value() RedisValue {
+	return rud.user
+}
+
+// `RedisUserStore` deprecated
+type RedisUserStore struct {
+	mtx *sync.RWMutex
+	*RedisClient
+}
+
+func NewRedisUserStore (opts *redis.Options) (*RedisUserStore, error) {
+	// verifying redis opts.
+	// stubby.
+	// not completed, yet.
+	return &RedisUserStore{
+		mtx:         &sync.RWMutex{},
+		RedisClient: NewRedisClient(opts),
+	}, nil
+}
+
+func (rus *RedisUserStore) Save (user User) error {
+	rus.mtx.Lock()
+	defer rus.mtx.Unlock()
+	ruser := NewRedisUserData(user)
+	if err := rus.setNX(ruser); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (rus *RedisUserStore) FindByKey(key string) (User, error) {
+	rus.mtx.RLock()
+	defer rus.mtx.RUnlock()
+	rCmd, err := rus.get(key)
+	if err != nil {
+		return nil, err
+	}
+	if marshaled, err := rCmd.Bytes(); err != nil {
+		return nil, err
+	} else {
+		user := &user{}
+		if err = json.Unmarshal(marshaled, user); err != nil {
+			return nil, err
+		} else {
+			return user, nil
+		}
+	}
+}

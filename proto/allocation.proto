@@ -2,10 +2,25 @@ syntax = "proto3";
 package proto;
 
 message AllocRequestDescription {
+  // TODO :: Add User Info, it would be needed.
   repeated ContainerResource descriptions = 1;
 }
 
-message AllocationResponse {
+message AllocResponse {
+  enum Status {
+    FAILED = 0;
+    PARTIALLY_SUCCEEDED = 1;
+    SUCCEEDED = 2;
+  }
+  repeated Result results = 1;
+}
+
+message Availability {
+  enum Status {
+    UN_AVAILABLE = 0;
+    PARTIALLY_AVAILABLE = 1;
+    AVAILABLE = 2;
+  }
   repeated Result results = 1;
 }
 
@@ -30,6 +45,6 @@ message Result {
   string additional = 2;
 }
 
-service KauloudManagementService {
-  rpc AllocationRequest(AllocRequestDescription) returns (AllocationResponse);
+service AllocAvailabilityService {
+  rpc CheckAvailability(AllocRequestDescription) returns (Availability);
 }
