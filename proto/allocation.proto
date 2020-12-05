@@ -25,7 +25,10 @@ message Availability {
 }
 
 message ContainerResource {
-  bool type = 1;
+  enum Type {
+    CPU = 0;
+    GPU = 1;
+  }
   int32 cpu = 2;
   int32 memory_in_mb = 3;
   int32 ephemeral_storage_in_gb = 4;
