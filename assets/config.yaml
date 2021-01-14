@@ -1,0 +1,21 @@
+virtManager:
+  gRPC:
+    address: ""
+    port: ""
+  namespace: "kauloud" # string, 유저 가상 머신 생성 namespace
+  baseImageNamespace: "base-images" # Todo :: image namespace 바꾸고, 클러스터 RBAC 재설정,
+  storageClassName: "rook-ceph-block"
+  vmPreset:
+    runStrategy: "Manual"
+    domainCpuCores: 1
+    resources:
+      cpu: "1"
+      memory: "2G"
+      storage: "32G" # It must be larger than base image data volume size.
+      gpu:
+        enabled: false
+        gpuName: "nvidia.com/TU102_GeForce_RTX_2080_Ti_Rev_A"
+    presetBaseImageName: "ubuntu-base-small"
+    labels:
+      kubevirt.io/vm: "defaultvm"
+      kauloud/userid: ""

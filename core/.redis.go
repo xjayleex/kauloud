@@ -1,4 +1,4 @@
-package main
+package k8s
 
 import (
 	"encoding"
@@ -40,7 +40,7 @@ type RedisClient struct {
 	*redis.Client
 }
 
-func NewRedisClient (opts *redis.Options, timeout ...interface{}) *RedisClient{
+func NewRedisClient (opts *redis.Options, timeout ...interface{}) *RedisClient {
 	if timeout == nil {
 		return &RedisClient{redis.NewClient(opts)}
 	} else {
@@ -145,10 +145,10 @@ func (rc *RedisClient) get(key string) (*redis.StringCmd, error) {
 
 
 type RedisUserData struct {
-	user User
+	user main2.User
 }
 
-func NewRedisUserData (user User) *RedisUserData {
+func NewRedisUserData (user main2.User) *RedisUserData {
 	return &RedisUserData{user: user}
 }
 
@@ -176,7 +176,7 @@ func NewRedisUserStore (opts *redis.Options) (*RedisUserStore, error) {
 	}, nil
 }
 
-func (rus *RedisUserStore) Save (user User) error {
+func (rus *RedisUserStore) Save (user main2.User) error {
 	rus.mtx.Lock()
 	defer rus.mtx.Unlock()
 	ruser := NewRedisUserData(user)
@@ -186,7 +186,7 @@ func (rus *RedisUserStore) Save (user User) error {
 	return nil
 }
 
-func (rus *RedisUserStore) FindByKey(key string) (User, error) {
+func (rus *RedisUserStore) FindByKey(key string) (main2.User, error) {
 	rus.mtx.RLock()
 	defer rus.mtx.RUnlock()
 	rCmd, err := rus.get(key)
@@ -196,7 +196,7 @@ func (rus *RedisUserStore) FindByKey(key string) (User, error) {
 	if marshaled, err := rCmd.Bytes(); err != nil {
 		return nil, err
 	} else {
-		user := &user{}
+		user := &main2.user{}
 		if err = json.Unmarshal(marshaled, user); err != nil {
 			return nil, err
 		} else {

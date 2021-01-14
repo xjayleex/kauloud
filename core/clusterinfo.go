@@ -1,7 +1,8 @@
-package main
+package k8s
 
 import (
 	"errors"
+	pb "github.com/xjayleex/kauloud/proto"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/api/core/v1"
@@ -10,16 +11,37 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-type AllocationGRPC struct {
+// TODO :: it would implement AllocAvailabilityService
+type ClusterResourceDescGRPC struct {
 	Server *grpc.Server
 	*ClusterResourceDescriber
 }
 
-func NewAllocationGRPC (gs *grpc.Server, crd *ClusterResourceDescriber) *AllocationGRPC {
-	return &AllocationGRPC{
+func NewClusterResourceDescGRPC (gs *grpc.Server, crd *ClusterResourceDescriber) *ClusterResourceDescGRPC {
+	return &ClusterResourceDescGRPC{
 		Server: gs,
 		ClusterResourceDescriber: crd,
 	}
+}
+
+func (cg *ClusterResourceDescGRPC) Serve(addr string) error {
+	return nil
+}
+
+func (cg *ClusterResourceDescGRPC) Close() {
+	cg.Server.Stop()
+}
+
+// rpc Call
+func (cg *ClusterResourceDescGRPC) CheckAvailability (ctx context.Context, req *pb.AllocRequestDescription) (*pb.Availability, error) {
+	if cg == nil {
+		return nil, errors.New("Error : There is no gRPC server object. Must check initialization. ")
+	}
+	/*descriptions := req.GetDescriptions()
+	avail := make([]*pb.Result, len(descriptions))
+	for _, description := range descriptions {
+
+	}*/
 }
 
 type ClusterResourceDescriber struct {
@@ -132,6 +154,8 @@ func (crd *ClusterResourceDescriber) getPodsList (ctx context.Context, selector 
 // cpu           5
 // gpu           3
 // mem ~~~~~~~~~~~~~~~~~~~~
+
+//
 
 func (crd *ClusterResourceDescriber) DescribeAllNodes (ctx context.Context) (*ResourceMap, *ResourceMap, error) {
 	allSelector, err := nodeParseSelector("")
