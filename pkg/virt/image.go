@@ -8,15 +8,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	cdiv1alpha1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 )
-type ReqFromGW struct {
+type VmCreationTemplate struct {
 	UserId    string
 	ImageCode VmImageCode
-	Resources Resources
-	Gpu       Gpu
+	Resources kauloud.Resources
 }
 
-type VmCreationTemplate struct {
-	*ReqFromGW
+type ParsedVmCreationTemplate struct {
+	*VmCreationTemplate
 	*BaseImageMeta
 	UUID uuid.UUID
 }
@@ -60,16 +59,6 @@ func GetImageOsMetaFromAnnotation(annotation map[string]string) *ImageOsMeta {
 
 func (o *ImageOsMeta) String() string {
 	return fmt.Sprintf("%s-%s", o.OsType, o.OsVersion)
-}
-
-type Gpu struct {
-	Enabled    bool
-	DeviceName string
-}
-
-type Resources struct {
-	Cpu string
-	Memory string
 }
 
 type VmImageCode string

@@ -16,11 +16,7 @@ import (
 )
 
 type ResourceDescriberInterface interface {
-	Availability(template interface{}) bool
-	Nodes() map[string]*corev1.Node
-	Requested() *ResourceMap
-	Limits() *ResourceMap
-	Allocatable()  *ResourceMap
+	IsAllocatable(interface{}) bool
 	Run(int, chan struct{})
 }
 
@@ -69,6 +65,44 @@ func NewPollingResourceDescriber (clientset *kubernetes.Clientset, logger *logru
 		DeleteFunc: new.deleteNode,
 	})
 	return new
+}
+
+func (o *PollingResourceDescriber) IsAllocatable(requests corev1.ResourceList) bool {
+	for nodeName, _ := range o.nodeList {
+		// if expectedAfterAlloc << o.allocatable -> return true
+		// Todo or not :: node condition Ready Check
+		if requested, err := o.requests.RefNodeResourceList(nodeName); err != nil {
+			continue
+		} else {
+			if expected := expectedAfterAllocation(requested, requests); o.isExpectedEnough(nodeName, expected) {
+				return true
+			} else {
+				continue
+			}
+		}
+	}
+	return false
+}
+
+func (o *PollingResourceDescriber) isExpectedEnough (nodeName string, expected corev1.ResourceList) bool {
+	if o.nodeList[nodeName] == nil {
+		return false
+	}
+	nodeAllocatable, err := o.allocatable.RefNodeResourceList(nodeName)
+	if err != nil {
+		return false
+	}
+
+	for resourceName, quantity := range expected {
+		allocatableQuantity, ok := nodeAllocatable[resourceName]
+		if !ok {
+			return false
+		}
+		if allocatableQuantity.Cmp(quantity) == -1 {
+			return false
+		} else { continue }
+	}
+	return true
 }
 
 func (o *PollingResourceDescriber) Run(threadiness int, stopCh chan struct{}) {
@@ -144,6 +178,8 @@ func (o *PollingResourceDescriber) addHandler(object interface{}, eventKey *Even
 	switch eventKey.resource {
 	case kauloud.ResourceAbbrPod:
 		err = o.handlePodAddition(object)
+	case kauloud.ResourceAbbrNode:
+		err = o.handleNodeAddition(object)
 	}
 	return err
 }
@@ -152,7 +188,7 @@ func (o *PollingResourceDescriber) deleteHandler(object interface{}, eventKey *E
 	o.logger.Debugf("Delete received for %s", eventKey.key.(string))
 	switch eventKey.resource {
 	case kauloud.ResourceAbbrPod:
-		err = o.handlePodDeletion(object)
+		err = o.handlePodDeletion(object, eventKey)
 	}
 	return err
 }
@@ -171,34 +207,43 @@ func (o *PollingResourceDescriber) updateHandler(object interface{}, eventKey *E
 func (o *PollingResourceDescriber) handlePodAddition (object interface{}) error {
 	pod, ok := object.(*corev1.Pod)
 	if !ok {
-		return errors.New("error on type assertion for pod")
+		return kauloud.ErrorTypeAssertionForPod
 	}
-
+	podName := ConcatenatedPodNameWithNamespace(pod.Namespace, pod.Name)
 	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded  {
 		return nil
 	}
 
-	o.podList[pod.Name] = pod
+	o.podList[podName] = pod
+
+	if pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" {
+		return kauloud.ErrorPodPendingWithNoNode
+	}
+
 	requests, limits := PodRequestsAndLimits(pod)
 	o.requests.add(pod.Spec.NodeName, requests)
 	o.limits.add(pod.Spec.NodeName, limits)
 	return nil
 }
 
-func (o *PollingResourceDescriber) handlePodDeletion (object interface{}) error {
+func (o *PollingResourceDescriber) handlePodDeletion (object interface{}, eventKey *EventKey) error {
+	var podName string
 	pod, ok := object.(*corev1.Pod)
-	if !ok {
-		return errors.New("error on type assertion for pod")
+	if ok {
+		podName = ConcatenatedPodNameWithNamespace(pod.Namespace, pod.Name)
+	} else {
+		podName = eventKey.key.(string)
+		pod = o.podList[podName]
 	}
 
-	if _, exists := o.podList[pod.Name]; !exists {
+	if _, exists := o.podList[podName]; !exists {
 		return nil
 	}
 
 	requests, limits := PodRequestsAndLimits(pod)
 	o.requests.sub(pod.Spec.NodeName, requests)
 	o.limits.sub(pod.Spec.NodeName, limits)
-	delete(o.podList, pod.Name)
+	delete(o.podList, podName)
 
 	return nil
 }
@@ -206,30 +251,68 @@ func (o *PollingResourceDescriber) handlePodDeletion (object interface{}) error 
 func (o *PollingResourceDescriber) handlePodUpdate (object interface{}) error {
 	pod, ok := object.(*corev1.Pod)
 	if !ok {
-		return errors.New("error on type assertion for pod")
+		return kauloud.ErrorTypeAssertionForNode
 	}
+	podName := ConcatenatedPodNameWithNamespace(pod.Namespace, pod.Name)
 
 	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
-		if _, exists := o.podList[pod.Name]; exists {
+		if _, exists := o.podList[podName]; exists {
 			requests, limits := PodRequestsAndLimits(pod)
 			o.requests.sub(pod.Spec.NodeName, requests)
 			o.limits.sub(pod.Spec.NodeName, limits)
-			delete(o.podList, pod.Name)
+			delete(o.podList, podName)
 		}
 		return nil
 	}
 
-	o.podList[pod.Name] = pod
+	o.podList[podName] = pod
 	return nil
 }
 
-func (o *PollingResourceDescriber) handleNodeAddition (object interface{}) {
+// 1. Add Node object to the node list.
+// 2. Add allocatable resource with the node.
+func (o *PollingResourceDescriber) handleNodeAddition (object interface{}) error {
+	node, ok := object.(*corev1.Node)
+	if !ok {
+		return kauloud.ErrorTypeAssertionForNode
+	}
+
+	o.nodeList[node.Name] = node
+	o.allocatable.add(node.Name, node.Status.Allocatable)
+	return nil
 }
 
-func (o *PollingResourceDescriber) handleNodeDeletion (object interface{}) {
+// 1. Try to delete Node object from node list.
+// 2. Try to delete allocatable resource associated with the node.
+func (o *PollingResourceDescriber) handleNodeDeletion (object interface{}, eventKey *EventKey) error {
+	var nodeName string
+	node, ok := object.(*corev1.Node)
+	if ok {
+		nodeName = node.Name
+	} else {
+		nodeName = eventKey.key.(string)
+		if node, ok = o.nodeList[nodeName]; !ok {
+			return errors.New("no node object on nodeList map")
+		}
+	}
+
+	if _, exists := o.nodeList[nodeName]; !exists {
+		return nil
+	}
+
+	delete(o.nodeList, nodeName)
+	o.allocatable.deleteNode(nodeName)
+	return nil
 }
 
-func (o *PollingResourceDescriber) handleNodeUpdate (object interface{}) {
+func (o *PollingResourceDescriber) handleNodeUpdate (object interface{}) error {
+	node, ok := object.(*corev1.Node)
+	if !ok {
+		return kauloud.ErrorTypeAssertionForNode
+	}
+	o.nodeList[node.Name] = node
+
+	return nil
 }
 
 func (o *PollingResourceDescriber) handleError (err error, key interface{}) {
@@ -239,14 +322,14 @@ func (o *PollingResourceDescriber) handleError (err error, key interface{}) {
 	}
 
 	if o.Queue.NumRequeues(key) < kauloud.ControllerMaxRequeue {
-		o.logger.Infof("error during sync %s %v", key.(string), err)
+		o.logger.Infof("error during sync %v %v", key, err)
 		o.Queue.AddRateLimited(key)
 		return
 	}
 
 	o.Queue.Forget(key)
 	runtime.HandleError(err)
-	o.logger.Infof("drop pod out of queue after many retries, %s %v",key.(string), err)
+	o.logger.Infof("drop pod out of queue after many retries, %v %v", key, err)
 }
 
 func (o *PollingResourceDescriber) addPod(obj interface{}) {
@@ -269,6 +352,7 @@ func (o *PollingResourceDescriber) deletePod(obj interface{}) {
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
+		o.logger.Debugf("deletion key : %s\n",key)
 		o.Queue.Add(eventKey)
 	}
 }
@@ -321,32 +405,29 @@ func (o *PollingResourceDescriber) updateNode (old interface{}, new interface{})
 	}
 }
 
-
 func (o *PollingResourceDescriber) runTestLister(stopCh <-chan struct{}) {
 	for {
-		time.Sleep(30 * time.Second)
+		time.Sleep(10 * time.Second)
 		if o.podList == nil {
 			continue
 		}
-		o.logger.Printf("---------- Requests ----------\n")
+		o.logger.Debugf("---------- Requests ----------\n")
 		for key, value := range o.requests.perNode {
-			o.logger.Printf("-- Node : %s --\n", key)
-			o.logger.Printf("Cpus := %s \n", value.Cpu().String())
-			o.logger.Printf("Memory := %s \n", value.Memory().String())
+			o.logger.Debugf("-- Node : %s --\n", key)
+			o.logger.Debugf("Cpus := %s \n", value.Cpu().String())
+			o.logger.Debugf("Memory := %s \n", value.Memory().String())
 		}
 
-		o.logger.Printf("---------- Limits ----------\n")
-		for key, value := range o.requests.perNode {
-			o.logger.Printf("-- Node : %s --\n", key)
-			o.logger.Printf("Cpus := %s \n", value.Cpu().String())
-			o.logger.Printf("Memory := %s \n", value.Memory().String())
+		o.logger.Debugf("\n---------- Limits ----------\n")
+		for key, value := range o.limits.perNode {
+			o.logger.Debugf("-- Node : %s --\n", key)
+			o.logger.Debugf("Cpus := %s \n", value.Cpu().String())
+			o.logger.Debugf("Memory := %s \n", value.Memory().String())
 		}
+		o.logger.Debugf("\n ==> Summary \n")
 	}
-
 	<- stopCh
 }
-
-
 
 type ResourceMap struct {
 	perNode map[string]corev1.ResourceList
@@ -357,6 +438,16 @@ func NewResourceMap () *ResourceMap {
 	return &ResourceMap{
 		perNode: make(map[string]corev1.ResourceList),
 		allNode: make(corev1.ResourceList),
+	}
+}
+
+func (rm *ResourceMap) RefNodeResourceList(nodeName string) (corev1.ResourceList, error) {
+	if resources, ok := rm.perNode[nodeName]; !ok {
+		return nil, errors.New("the resource list has no data with this node")
+	} else {
+		// if we need to return new resource object instead of origin map pointer,
+		// return resources.DeepCopy()
+		return resources, nil
 	}
 }
 
@@ -404,11 +495,11 @@ func (rm *ResourceMap) sub(nodeName string, resources corev1.ResourceList) {
 	}
 }
 
-func (rm *ResourceMap) addNode(node *corev1.Node) {
-	rm.perNode[node.Name] = make(corev1.ResourceList)
-
-}
-
-func (rm *ResourceMap) deleteNode (node *corev1.Node) {
-	// Todo something
+func (rm *ResourceMap) deleteNode(nodeName string) {
+	resources, ok := rm.perNode[nodeName]
+	if !ok {
+		return
+	}
+	rm.sub(nodeName, resources)
+	delete(rm.perNode, nodeName)
 }

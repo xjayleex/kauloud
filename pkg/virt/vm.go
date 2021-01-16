@@ -171,11 +171,11 @@ type virtualMachineBuilder struct {
 	new *virtv1.VirtualMachine
 
 	config *utils.KauloudConfig
-	template *VmCreationTemplate
+	template *ParsedVmCreationTemplate
 	labels map[string]string
 }
 
-func (b *virtualMachineBuilder) Template(template *VmCreationTemplate) *virtualMachineBuilder {
+func (b *virtualMachineBuilder) Template(template *ParsedVmCreationTemplate) *virtualMachineBuilder {
 	b.template = template
 	return b
 }
@@ -193,11 +193,11 @@ func (b *virtualMachineBuilder) Config(config *utils.KauloudConfig) *virtualMach
 func (b *virtualMachineBuilder) Build() *virtv1.VirtualMachine {
 	nilString := ""
 	fmt.Println(b.config.VirtManagerConfig.StorageClassName)
-	if b.template.Gpu.Enabled {
+	if b.template.Resources.Gpu.Enabled {
 		b.new.Spec.Template.Spec.Domain.Devices.GPUs = []virtv1.GPU{
 			{
 				Name: "gpu",
-				DeviceName: b.template.Gpu.DeviceName,
+				DeviceName: b.template.Resources.Gpu.DeviceName,
 			},
 		}
 	}

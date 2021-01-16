@@ -64,16 +64,16 @@ func (o *VirtManager) ListVmi(namespace string, options *metav1.ListOptions) (*v
 	return vmiList, err
 }
 
-func (o *VirtManager) CreateVmWorkload (req ReqFromGW) error {
+func (o *VirtManager) CreateVmWorkload (req VmCreationTemplate) error {
 	imageMeta, ok := o.ImageMgr().RefBaseImageMetaMap(req.ImageCode)
 	if !ok {
 		return errors.New("no matching images")
 	}
 
-	template := &VmCreationTemplate{
-		ReqFromGW:     &req,
-		BaseImageMeta: imageMeta,
-		UUID:          uuid.New(),
+	template := &ParsedVmCreationTemplate{
+		VmCreationTemplate: &req,
+		BaseImageMeta:      imageMeta,
+		UUID:               uuid.New(),
 	}
 	workload := o.WorkloadMgr().NewVmWorkload(template)
 	svc, err := o.VirtClient().CoreV1().Services(o.config.VirtManagerConfig.Namespace).Create(workload.Service)
@@ -211,7 +211,7 @@ func (o *VmWorkloadManager) VmPreset() *defaultVirtualMachine {
 	return o.vmPreset
 }
 
-func (o *VmWorkloadManager) NewVmWorkload(template *VmCreationTemplate) *VmWorkload {
+func (o *VmWorkloadManager) NewVmWorkload(template *ParsedVmCreationTemplate) *VmWorkload {
 	new := &VmWorkload{
 		VirtualMachine: o.newVmObject(template),
 		Service:        nil,
@@ -220,7 +220,7 @@ func (o *VmWorkloadManager) NewVmWorkload(template *VmCreationTemplate) *VmWorkl
 	return new
 }
 
-func (o *VmWorkloadManager) newVmObject(template *VmCreationTemplate) *virtv1.VirtualMachine {
+func (o *VmWorkloadManager) newVmObject(template *ParsedVmCreationTemplate) *virtv1.VirtualMachine {
 	must := map[string]string {
 		kauloud.LabelKeyKauloudUserId:    template.UserId,
 		kauloud.LabelKeyKauloudImageCode: template.ImageCode.String(),

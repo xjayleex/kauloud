@@ -1,6 +1,7 @@
 package informer
 
 import (
+	"fmt"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 )
@@ -50,6 +51,19 @@ func addResourceList(list, new corev1.ResourceList) {
 	}
 }
 
+func expectedAfterAllocation(now, req corev1.ResourceList) corev1.ResourceList {
+	expected := now.DeepCopy()
+	for name, quantity := range req {
+		if value, ok := expected[name]; !ok {
+			continue
+		} else {
+			value.Add(quantity)
+			expected[name] = value
+		}
+	}
+	return expected
+}
+
 func maxResourceList(list, new corev1.ResourceList) {
 	for name, quantity := range new {
 		if value, ok := list[name]; !ok {
@@ -61,4 +75,8 @@ func maxResourceList(list, new corev1.ResourceList) {
 			}
 		}
 	}
+}
+
+func ConcatenatedPodNameWithNamespace(namespace string, podName string) string {
+	return fmt.Sprintf("%s/%s", namespace, podName)
 }

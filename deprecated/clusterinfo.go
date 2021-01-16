@@ -1,8 +1,7 @@
-package k8s
+package tmp
 
 import (
 	"errors"
-	pb "github.com/xjayleex/kauloud/proto"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/api/core/v1"
@@ -56,7 +55,9 @@ type ClusterResourceDescriber struct {
 
 func NewClusterResourceDescriber (client *KubeClient, namespace string) (*ClusterResourceDescriber, error) {
 	// TODO :: make `namespace` on the cmd codes.
-	crd := &ClusterResourceDescriber{clientset: client.Clientset()}
+	crd := &ClusterResourceDescriber{
+		clientset: client.Clientset(),
+	}
 	crd.namespace = namespace
 	_, err := crd.NodeList()
 	if err != nil {
@@ -81,7 +82,7 @@ func (crd *ClusterResourceDescriber) UpdatedNodeList (ctx context.Context) (*v1.
 		return nil, errors.New("clientset nil error")
 	}
 
-	nodes, err := crd.clientset.CoreV1().Nodes().List(ctx,  metav1.ListOptions{})
+	nodes, err := crd.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	return nodes, err
 }
 
@@ -186,7 +187,6 @@ func (crd *ClusterResourceDescriber) DescribeAllNodes (ctx context.Context) (*Re
 type ResourceMap struct {
 	PerNode map[string]v1.ResourceList
 	Total   v1.ResourceList
-
 }
 
 func NewResourceMap (nodes *v1.NodeList) *ResourceMap {
