@@ -1,41 +1,48 @@
 syntax = "proto3";
 package proto;
 
+// Informer Services
+
+service AllocAdmissionService {
+  rpc CheckAvailability(WorkloadInfo) returns (Availability);
+}
+
+// As a user view,
+message WorkloadInfo {
+  WorkloadType type = 1;
+  string userid = 2;
+  string token = 3;
+  string workload_name = 4;
+}
+
+enum WorkloadType {
+  VirtualMachineType = 0;
+  ContainerType = 1;
+}
+
 message AllocRequestDescription {
-  // TODO :: Add User Info, it would be needed.
-  repeated ContainerResource descriptions = 1;
+  // Todo :: think about the user_id extracted from. from raw request or reference vm's annotations?
+  string user_id = 1;
+  ContainerResourceSpec spec = 2;
 }
 
-message AllocResponse {
-  enum Status {
-    FAILED = 0;
-    PARTIALLY_SUCCEEDED = 1;
-    SUCCEEDED = 2;
-  }
-  repeated Result results = 1;
+
+message ContainerResourceSpec {
+  Resources resources = 1;
+  string image_code = 2;
+  repeated HostAlias host_aliases = 3;
 }
 
-message Availability {
-  enum Status {
-    UN_AVAILABLE = 0;
-    PARTIALLY_AVAILABLE = 1;
-    AVAILABLE = 2;
-  }
-  repeated Result results = 1;
+message Resources {
+  string cpu = 1;
+  string memory = 2;
+  string ephemeral = 3; //
+  Gpu gpu = 4;
 }
 
-message ContainerResource {
-  enum Type {
-    CPU = 0;
-    GPU = 1;
-  }
-  int32 cpu = 2;
-  int32 memory_in_mb = 3;
-  int32 ephemeral_storage_in_gb = 4;
-  string persistent_volume_claim_code = 5;
-  repeated HostAlias host_aliases = 6;
-  string image = 7;
-  //string token;
+message Gpu {
+  bool enabled = 1;
+  string device_name = 2;
 }
 
 message HostAlias {
@@ -43,11 +50,6 @@ message HostAlias {
   repeated string host_names = 2;
 }
 
-message Result {
+message Availability {
   bool ok = 1;
-  string additional = 2;
-}
-
-service AllocAvailabilityService {
-  rpc CheckAvailability(AllocRequestDescription) returns (Availability);
 }
