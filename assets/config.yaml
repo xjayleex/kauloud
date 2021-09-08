@@ -1,3 +1,6 @@
+informer:
+resourceDesciber:
+  skipCompressibleResource: true
 virtManager:
   gRPC:
     address: ""
@@ -19,3 +22,4 @@ virtManager:
     labels:
       kubevirt.io/vm: "defaultvm"
       kauloud/userid: ""
+  gracePeriodSeconds: 3 # must be bigger than zero.

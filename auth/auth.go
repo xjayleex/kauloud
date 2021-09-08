@@ -1,4 +1,4 @@
-package main
+package auth
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/dgrijalva/jwt-go"
-	"github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	pb "github.com/xjayleex/kauloud/proto"
@@ -15,7 +14,6 @@ import (
 	"google.golang.org/grpc"
 	"net"
 	"os"
-	"sync"
 	"time"
 )
 
@@ -32,17 +30,17 @@ func NewAuthGRPC (gs *grpc.Server,auth *AuthServer) *AuthGRPC {
 	}
 }
 
-func (ag *AuthGRPC) Serve(addr string) error {
-	lis, err := net.Listen("tcp", addr)
+func (ag *AuthGRPC) Serve(address string) error {
+	listen, err := net.Listen("tcp", address)
 
 	if err != nil {
-		ag.Logger().Fatalf("Failed to listen: %v", addr)
-		return errors.New("Failed to listen: " + addr)
+		ag.Logger().Fatalf("Failed to listen: %v", address)
+		return errors.New("Failed to listen: " + address)
 	}
 
-	ag.Logger().Infof("Serving Auth gRPC Server :: listening on %v", addr)
+	ag.Logger().Infof("Serving Auth gRPC Server :: listening on %v", address)
 
-	if err = ag.Server.Serve(lis); err != nil {
+	if err = ag.Server.Serve(listen); err != nil {
 		return err
 	}
 	ag.Logger().Info("Terminating Auth gRPC Server ...")
@@ -112,7 +110,7 @@ func (ag *AuthGRPC) SignIn (ctx context.Context, req *pb.SignInRequest) (*pb.Sig
 	if user == nil {
 		return nil, errors.New("Authserver : nil user.")
 	} else if !user.IsCorrectPassword(req.GetPassword()) {
-		return nil, ErrIncorrectInfo
+		return nil, main2.ErrIncorrectInfo
 	}
 
 	token, err := ag.JwtManager().Generate(user)
@@ -228,7 +226,7 @@ func (manager *JWTManager) VerifyToken(accessToken string) (*UserClaims, error) 
 		func(token *jwt.Token) (interface{}, error){
 			_, ok := token.Method.(*jwt.SigningMethodHMAC)
 			if !ok {
-				return nil, ErrUnexpectedToken
+				return nil, main2.ErrUnexpectedToken
 			}
 			return []byte(manager.secretKey), nil
 		})
@@ -238,7 +236,7 @@ func (manager *JWTManager) VerifyToken(accessToken string) (*UserClaims, error) 
 
 	claims, ok := token.Claims.(*UserClaims)
 	if !ok {
-		return nil, ErrInvalidClaims
+		return nil, main2.ErrInvalidClaims
 	}
 	return claims, nil
 }
@@ -355,28 +353,12 @@ func (u *user) Value() interface{} {
 	return *u // pointer 쓰는 것 맞나 ? 체크하자.
 }
 
-type RedisUserData struct {
-	user User
-}
-
-func NewRedisUserData (user User) *RedisUserData {
-	return &RedisUserData{user: user}
-}
-
-func (rud *RedisUserData) Key() string {
-	return rud.user.ID()
-}
-
-func (rud *RedisUserData) Value() RedisValue {
-	return rud.user
-}
-
 type UserStore interface {
 	Save(user User) error
 	FindByKey(string) (User, error)
 }
 
-// for mysql or postre, etc...
+// for mysql or postgres, etc...
 type RDBUserStore struct {
 	RDBStore
 }
@@ -401,50 +383,6 @@ func (rdbus *RDBUserStore) FindByKey(key string) (User, error){
 			return userClaimBean, nil
 		} else {
 			return nil, errors.New("no matched item.")
-		}
-	}
-}
-
-type RedisUserStore struct {
-	mtx *sync.RWMutex
-	*RedisClient
-}
-
-func NewRedisUserStore (opts *redis.Options) (*RedisUserStore, error) {
-	// verifying redis opts.
-	// stubby.
-	// not completed, yet.
-	return &RedisUserStore{
-		mtx:         &sync.RWMutex{},
-		RedisClient: NewRedisClient(opts),
-	}, nil
-}
-
-func (rus *RedisUserStore) Save (user User) error {
-	rus.mtx.Lock()
-	defer rus.mtx.Unlock()
-	ruser := NewRedisUserData(user)
-	if err := rus.setNX(ruser); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (rus *RedisUserStore) FindByKey(key string) (User, error) {
-	rus.mtx.RLock()
-	defer rus.mtx.RUnlock()
-	rCmd, err := rus.get(key)
-	if err != nil {
-		return nil, err
-	}
-	if marshaled, err := rCmd.Bytes(); err != nil {
-		return nil, err
-	} else {
-		user := &user{}
-		if err = json.Unmarshal(marshaled, user); err != nil {
-			return nil, err
-		} else {
-			return user, nil
 		}
 	}
 }

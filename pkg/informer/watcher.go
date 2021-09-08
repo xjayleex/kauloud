@@ -1,10 +1,11 @@
 package informer
 
 import (
-	"errors"
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/xjayleex/kauloud/pkg/api/kauloud"
+	"github.com/xjayleex/kauloud/pkg/utils"
+	pb "github.com/xjayleex/kauloud/proto"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -18,30 +19,25 @@ import (
 )
 
 type Watcher struct {
+	logger          *logrus.Logger
+	Queue           workqueue.RateLimitingInterface
+	running         bool
+	workloadMetaMap map[string]*kauloud.WorkloadMeta
+	vmInfoList      VirtualMachineInfoList
+
 	podInformer cache.SharedInformer
 	vmInformer cache.SharedInformer
 	dvInformer cache.SharedInformer
 	svcInformer cache.SharedInformer
-
-	logger *logrus.Logger
-
-	Queue workqueue.RateLimitingInterface
-
-	vmList         map[string]*virtv1.VirtualMachine
-	podList        map[string]*corev1.Pod
-	dataVolumeList map[string]*cdiv1.DataVolume
-
-	vmListByUser map[string]map[string]*virtv1.VirtualMachine
 }
 
 func NewWatcher(client kubecli.KubevirtClient, logger *logrus.Logger) *Watcher {
 	new := &Watcher{
-		logger:         logger,
-		Queue:          workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		vmList:         make(map[string]*virtv1.VirtualMachine),
-		dataVolumeList: make(map[string]*cdiv1.DataVolume),
-
-		vmListByUser: make(map[string]map[string]*virtv1.VirtualMachine),
+		logger:          logger,
+		Queue:           workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		running:         false,
+		workloadMetaMap: make(map[string]*kauloud.WorkloadMeta),
+		vmInfoList:      NewVirtualMachineInfoList(),
 	}
 
 	podLW := cache.NewListWatchFromClient(client.CoreV1().RESTClient(),"pods", kauloud.TargetNamespace, fields.Everything())
@@ -83,31 +79,20 @@ func (w *Watcher) Logger() *logrus.Logger {
 	return w.logger
 }
 
-func (w *Watcher) VmList() map[string]*virtv1.VirtualMachine {
-	return w.vmList
-}
-
-func (w *Watcher) PodList() map[string]*corev1.Pod {
-	return w.podList
-}
-
-func (w *Watcher) DataVolumeList() map[string]*cdiv1.DataVolume {
-	return w.dataVolumeList
-}
-
-func (w *Watcher) VmListByUser() map[string]map[string]*virtv1.VirtualMachine {
-	return w.vmListByUser
+func (w *Watcher) VmInfoList() VirtualMachineInfoList {
+	return w.vmInfoList
 }
 
 func (w *Watcher) Run (threadiness int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 	defer w.Queue.ShutDown()
-	w.logger.Infoln("Starting controller.")
+	w.logger.Infoln("Starting Watcher.")
 	go w.podInformer.Run(stopCh)
 	go w.vmInformer.Run(stopCh)
 	go w.dvInformer.Run(stopCh)
-	go w.runTestLister2(stopCh)
-	if !cache.WaitForCacheSync(stopCh, w.podInformer.HasSynced, w.vmInformer.HasSynced, w.dvInformer.HasSynced) {
+	go w.svcInformer.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, w.podInformer.HasSynced, w.vmInformer.HasSynced, w.dvInformer.HasSynced, w.svcInformer.HasSynced) {
 		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 		return
 	}
@@ -116,8 +101,18 @@ func (w *Watcher) Run (threadiness int, stopCh chan struct{}) {
 		w.logger.Infoln("Run watch dogs for watcher.")
 		go wait.Until(w.runWorker, time.Second, stopCh)
 	}
+	w.running = true
+	defer func() {w.running = false}()
 	<-stopCh
 	w.logger.Infoln("Stopping watcher.")
+}
+
+func (w *Watcher) GetUserVirtualMachineInfoList (userid kauloud.UserID) (map[kauloud.UUID]*VirtualMachineInfo, error) {
+	return w.vmInfoList.GetUserVirtualMachineInfoList(userid)
+}
+
+func (w *Watcher) GetVirtualMachineInfo (userid kauloud.UserID, uuid kauloud.UUID) (*VirtualMachineInfo, error) {
+	return w.vmInfoList.GetVirtualMachineInfo(userid, uuid)
 }
 
 func (w *Watcher) runWorker() {
@@ -131,39 +126,41 @@ func (w *Watcher) consume() bool {
 	}
 	defer w.Queue.Done(key)
 
-	err := w.sync(key.(EventKey))
+	err := w.sync(key.(Event))
 	w.handleError(err, key)
 	return true
 }
 
-func (w *Watcher) sync(eventKey EventKey) error {
+func (w *Watcher) sync(event Event) error {
 	var object interface{}
 	var exists bool
 	var err	error
 
-	switch eventKey.resource {
+	switch event.resource {
 	case kauloud.ResourceAbbrVirtualMachine:
-		object, exists, err = w.vmInformer.GetStore().GetByKey(eventKey.key.(string))
+		object, exists, err = w.vmInformer.GetStore().GetByKey(event.GetKey())
 	case kauloud.ResourceAbbrPod:
-		object, exists, err = w.podInformer.GetStore().GetByKey(eventKey.key.(string))
+		object, exists, err = w.podInformer.GetStore().GetByKey(event.GetKey())
 	case kauloud.ResourceAbbrDataVolume:
-		object, exists, err = w.dvInformer.GetStore().GetByKey(eventKey.key.(string))
+		object, exists, err = w.dvInformer.GetStore().GetByKey(event.GetKey())
+	case kauloud.ResourceAbbrService:
+		object, exists, err = w.svcInformer.GetStore().GetByKey(event.GetKey())
 	}
 
 	if err != nil {
-		w.logger.Infof("error fetching object from index for the specified key. %s %v", eventKey.key.(string), err)
+		w.logger.Infof("error fetching object from index for the specified key. %s %v", event.GetKey(), err)
 		return err
 	}
 
 	if !exists {
-		err := w.deleteHandle(object, &eventKey)
+		err := w.deleteHandler(&event)
 		return err
 	}
 
-	if eventKey.verb == kauloud.WatcherEventVerbAdd {
-		err = w.addHandle(object, &eventKey)
+	if event.verb == kauloud.WatcherEventVerbAdd {
+		err = w.addHandler(object, &event)
 	} else { // "update"
-		err = w.updateHandle(object, &eventKey)
+		err = w.updateHandler(object, &event)
 	}
 
 	return err
@@ -186,335 +183,485 @@ func (w *Watcher) handleError (err error, key interface{}) {
 	w.logger.Infof("drop pod out of queue after many retries, %s %v",key.(string), err)
 }
 
-func (w *Watcher) runTestLister (stopCh <-chan struct{}) {
-	for {
-		time.Sleep(10 * time.Second)
-		if w.vmList == nil {
-			continue
-		}
-
-		for key := range w.vmList {
-			vmstat, err := w.refVmStatus(key)
-			if err != nil {
-				w.logger.Infof("error on listing the vm name is : %s\n",key)
-				continue
-			}
-			w.logger.Infof("Listing : %s\n", vmstat.String())
-		}
-	}
-	<- stopCh
-}
-
-func (w *Watcher) runTestLister2 (stopCh <-chan struct{}) {
-	for {
-		time.Sleep(10 * time.Second)
-		if w.vmListByUser == nil {
-			w.logger.Infof("Error on listing ...\n")
-			continue
-		}
-
-		for key, value := range w.vmListByUser {
-			w.logger.Infof("Listing for %s ...\n", key)
-			for insideKey := range value {
-				vmstat, err := w.refVmStatus(insideKey)
-				if err != nil {
-					w.logger.Infof("... error on listing the vm name is : %s\n",key)
-					continue
-				}
-				w.logger.Infof("... %s\n", vmstat.String())
-			}
-		}
-	}
-	<- stopCh
-}
-
 func (w *Watcher) addPod(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) deletePod(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) updatePod (old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) addVm(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrVirtualMachine,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) deleteVm(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrVirtualMachine,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) updateVm (old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrVirtualMachine,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) addDv(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrDataVolume,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) deleteDv(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrDataVolume,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) updateDv(old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrDataVolume,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) addSvc(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrService,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) deleteSvc(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrService,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
 func (w *Watcher) updateSvc(old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrService,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		w.Queue.Add(eventKey)
+		w.Queue.Add(event)
 	}
 }
 
-func (w *Watcher) refVmStatus (vmName string) (*VirtualMachineStatus, error){
-	vm, ok := w.vmList[vmName]
+func (w *Watcher) handleVirtualMachineUpdate(object interface{}, event *Event) error {
+	vm, ok := object.(*virtv1.VirtualMachine)
 	if !ok {
-		return nil, errors.New("vm does not exists")
-	}
-	vmStatus := &VirtualMachineStatus{}
-
-	if len(vm.Spec.DataVolumeTemplates) == 0 {
-		return nil, errors.New("dv does not exists")
-	}
-	dv, ok := w.dataVolumeList[vm.Spec.DataVolumeTemplates[0].Name]
-	if !ok {
-		return nil, errors.New("dv does not exists")
+		return kauloud.ErrorTypeAssertionForVM
 	}
 
-	if dv.Status.Phase == kauloud.DataVolumeSucceed {
-		vmStatus.isReady = true
-	} else {
-		vmStatus.isReady = false
+	meta := utils.ExtractWorkloadMetaFromLabels(vm.Labels)
+
+	// Because userid and uuid never change, maybe we need to do nothing when key exists.
+	if _, ok := w.workloadMetaMap[event.GetKey()]; !ok {
+		w.workloadMetaMap[event.GetKey()] = meta
 	}
-	vmStatus.vm = vm
-	vmStatus.progress = string(dv.Status.Progress)
-	vmStatus.isRunning = vm.Status.Created
-	return vmStatus, nil
+
+	target := w.vmInfoList.referVirtualMachineInfo(meta)
+	target.Object.SetVirtualMachine(vm)
+	target.updateStatOnVirtualMachineUpdate()
+	return nil
 }
 
-func (w *Watcher) addHandle (object interface{}, eventKey *EventKey) (err error) {
-	w.logger.Debugf("Add received for %s", eventKey.key.(string))
-	switch eventKey.resource {
+func (w *Watcher) handleServiceUpdate(object interface{}) error {
+	service, ok := object.(*corev1.Service)
+	if !ok {
+		return kauloud.ErrorTypeAssertionForService
+	}
+
+	serviceType := service.Spec.Type
+	meta := utils.ExtractWorkloadMetaFromLabels(service.Labels)
+
+	target := w.vmInfoList.referVirtualMachineInfo(meta)
+	switch serviceType {
+	case corev1.ServiceTypeClusterIP:
+		target.Object.SetClusterIPService(service)
+		target.updateStatOnClusterIPServiceUpdate()
+	}
+	return nil
+}
+
+// This function must handle both BASE IMAGE DataVolume and USER VM DataVolume.
+// If all VirtualMachines are created by our system, we can be sure that at least
+// USER VM DataVolume has label for `kauloud.LabelKeyKauloudDvType`, and the matched value is
+// `kauloud.LabelValueKauloudDvTypeUserVmImage`.
+// 1. BASE IMAGE DataVolume Added or Updated
+// 2. USER VM DataVolume with appropriate labels Added or Updated
+// 3. USER VM DataVolume with non-appropriate labels Added or Updated
+// ** NOTE ** 'appropriate' means that DataVolume has label for 'LabelKeyKauloudDvType'
+func (w *Watcher) handleDataVolumeUpdate(object interface{}) error {
+	datavolume, ok := object.(*cdiv1.DataVolume)
+	if !ok {
+		return kauloud.ErrorTypeAssertionForDatavolume
+	}
+	// Before extracting metadata, we must identify that the datavolume is
+	// base image, or user vm datavolume.
+	if dvType, ok := datavolume.Labels[kauloud.LabelKeyKauloudDvType]; ok {
+		switch dvType {
+		case kauloud.LabelValueKauloudDvTypeBaseImage:
+			// if we need to manage image metadata on 'Watcher',
+			// we can write code more on this loop.
+			return nil
+		case kauloud.LabelValueKauloudDvTypeUserVmImage:
+			meta := utils.ExtractWorkloadMetaFromLabels(datavolume.Labels)
+			target := w.vmInfoList.referVirtualMachineInfo(meta)
+			target.Object.SetDataVolume(datavolume)
+			target.updateStatOnDataVolumeUpdate()
+			return nil
+		default:
+			// If condition reaches here, it means the datavolume has non-appropriate
+			// label value for the DataVolumeType. Then, we don't return, and process some handling
+			// for this exception from below codes.
+		}
+	}
+	// DataVolume has no label key for DataVolume Type reaches here.
+	// Such DataVolume is one of the following.
+	// 1. Uploaded with 'virtctl image-upload'
+	// 2. Cloned with no DataVolumeType label from no-appropriate virtual machine yaml specification, or the other.
+
+	return nil
+}
+// When Virtual machine deleted, we need to delete all metadata about the workload. (workloadMetaMap entry, VmStatusMap entry)
+// 1. Get workloadMetaMap by event key and delete this associated entry from workloadMetaMap.
+// 2. Delete associated entry from VmStatusMap with Metadata.
+// 3. Delete all pointer to the workload objects.
+func (w *Watcher) handleVirtualMachineDeletion(event *Event) error {
+	meta, ok := w.workloadMetaMap[event.GetKey()]
+	if !ok {
+		return nil
+	}
+	delete(w.workloadMetaMap, event.GetKey())
+	deleted, err := w.vmInfoList.deleteVirtualMachineInfo(meta)
+	if err != nil {
+		return nil
+	}
+	deleted.updateStatOnVirtualMachineDeletion()
+	meta, deleted = nil, nil
+	return nil
+}
+
+// Service deletion must affect only specific service with serviceType
+func (w *Watcher) handleServiceDeletion(event *Event) error {
+	meta, ok := w.workloadMetaMap[event.GetKey()]
+	if !ok {
+		return nil
+	}
+	if _, ok := w.vmInfoList[meta.Owner]; !ok {
+		return nil
+	}
+	target, ok := w.vmInfoList[meta.Owner][meta.UUID]
+	if !ok {
+		return nil
+	}
+	serviceType, err := utils.GetServiceTypeFromEventKey(event.key.(string))
+	if err != nil {
+		return err
+	}
+	switch serviceType {
+	case corev1.ServiceTypeClusterIP:
+		target.updateStatOnClusterIPServiceDeletion()
+	}
+	return nil
+}
+
+func (w *Watcher) handleDataVolumeDeletion(event *Event) error {
+	meta, ok := w.workloadMetaMap[event.GetKey()]
+	if !ok {
+		return nil
+	}
+	if _, ok := w.vmInfoList[meta.Owner]; !ok {
+		return nil
+	}
+	target, ok := w.vmInfoList[meta.Owner][meta.UUID]
+	if !ok {
+		return nil
+	}
+	target.updateStatOnDataVolumeDeletion()
+	return nil
+}
+
+func (w *Watcher) addHandler(object interface{}, event *Event) (err error) {
+	w.logger.Debugf("Add received for %s", event.GetKey())
+	switch event.resource {
 	case kauloud.ResourceAbbrDataVolume:
-		dv, ok := object.(*cdiv1.DataVolume)
-		if !ok {
-			return nil
-		}
-		w.dataVolumeList[dv.Name] = dv
+		err = w.handleDataVolumeUpdate(object)
 	case kauloud.ResourceAbbrVirtualMachine:
-		vm, ok := object.(*virtv1.VirtualMachine)
-		if !ok {
-			return nil
-		}
-		w.vmList[vm.Name] = vm
-		///////////////////////////////////////
-		userId, ok := vm.Labels[kauloud.LabelKeyKauloudUserId]
-		if ok {
-			if w.vmListByUser[userId] == nil {
-				w.vmListByUser[userId] = map[string]*virtv1.VirtualMachine{}
-			}
-			w.vmListByUser[userId][vm.Name] = vm
-		}
-		///////////////////////////////////////
+		err = w.handleVirtualMachineUpdate(object, event)
 	case kauloud.ResourceAbbrService:
-		// TODO : svc watch handle
-
+		err = w.handleServiceUpdate(object)
 	}
 	return err
 }
 
-func (w *Watcher) deleteHandle (object interface{}, eventKey *EventKey) (err error)  {
-	w.logger.Debugf("obj has deleted %s", eventKey.key.(string))
+func (w *Watcher) deleteHandler (event *Event) (err error)  {
+	w.logger.Debugf("obj has deleted %s", event.GetKey())
 
-	switch eventKey.resource {
+	switch event.resource {
 	case kauloud.ResourceAbbrDataVolume:
-		dv, ok := object.(*cdiv1.DataVolume)
-		if !ok {
-			return nil
-		}
-		delete(w.dataVolumeList, dv.Name)
+		err = w.handleDataVolumeDeletion(event)
 	case kauloud.ResourceAbbrVirtualMachine:
-		vm, ok := object.(*virtv1.VirtualMachine)
-		if !ok {
-			return nil
-		}
-		delete(w.vmList, vm.Name)
-		///////////////////////////////////////
-		userId, ok := vm.Labels[kauloud.LabelKeyKauloudUserId]
-		if ok {
-			vmForUser := w.vmListByUser[userId]
-			delete(vmForUser, vm.Name)
-		}
-		///////////////////////////////////////
+		err = w.handleVirtualMachineDeletion(event)
+	case kauloud.ResourceAbbrService:
+		err = w.handleServiceDeletion(event)
 	}
 
 	return err
 }
 
-func (w *Watcher) updateHandle (object interface{}, eventKey *EventKey) (err error) {
-	w.logger.Infof("Update received for %s", eventKey.key.(string))
-	switch eventKey.resource {
+func (w *Watcher) updateHandler (object interface{}, event *Event) (err error) {
+	w.logger.Infof("Update received for %s", event.GetKey())
+	switch event.resource {
 	case kauloud.ResourceAbbrDataVolume:
-		dv, ok := object.(*cdiv1.DataVolume)
-		if !ok {
-			return nil
-		}
-		w.dataVolumeList[dv.Name] = dv
+		err = w.handleDataVolumeUpdate(object)
 	case kauloud.ResourceAbbrVirtualMachine:
-		vm, ok := object.(*virtv1.VirtualMachine)
-		if !ok {
-			return nil
-		}
-		w.vmList[vm.Name] = vm
-		///////////////////////////////////////
-		userId, ok := vm.Labels[kauloud.LabelKeyKauloudUserId]
-		if ok {
-			if w.vmListByUser[userId] == nil {
-				w.vmListByUser[userId] = map[string]*virtv1.VirtualMachine{}
-			}
-			w.vmListByUser[userId][vm.Name] = vm
-		}
-		///////////////////////////////////////
+		err = w.handleVirtualMachineUpdate(object, event)
+	case kauloud.ResourceAbbrService:
+		err = w.handleServiceUpdate(object)
 	}
 	return err
 }
 
-
-type EventKey struct {
+type Event struct {
 	resource string
 	verb string
 	key interface{}
 }
 
-type VirtualMachineStatus struct {
-	isReady   bool
-	progress  string
-	isRunning bool
-	vm *virtv1.VirtualMachine
+func (e *Event) GetKey() string {
+	return e.key.(string)
 }
 
-func (vms *VirtualMachineStatus) IsReady() bool{
-	return vms.isReady
+type VirtualMachineInfoList map[kauloud.UserID]map[kauloud.UUID]*VirtualMachineInfo
+
+func NewVirtualMachineInfoList() map[kauloud.UserID]map[kauloud.UUID]*VirtualMachineInfo {
+	return make(map[kauloud.UserID]map[kauloud.UUID]*VirtualMachineInfo)
 }
 
-func (vms *VirtualMachineStatus) Progress() string{
-	return vms.progress
+func (list VirtualMachineInfoList) GetUserVirtualMachineInfoList(userid kauloud.UserID) (map[kauloud.UUID]*VirtualMachineInfo, error) {
+	out, ok := list[userid]
+	if !ok {
+		return nil, fmt.Errorf("no virtual machine for user : %s", userid)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no virtual machine for user : %s", userid)
+	}
+	return out, nil
 }
 
-func (vms *VirtualMachineStatus) IsRunning() bool{
-	return vms.isRunning
+func (list VirtualMachineInfoList) GetVirtualMachineInfo(userid kauloud.UserID, uuid kauloud.UUID) (*VirtualMachineInfo, error) {
+	perUserList, ok := list[userid]
+	if !ok {
+		return nil, fmt.Errorf("no virtual machine for user : %s", userid)
+	}
+	info, ok := perUserList[uuid]
+	if !ok {
+		return nil, fmt.Errorf("no virtual machine for uuid : %s", uuid)
+	}
+	return info, nil
 }
 
-func (vms *VirtualMachineStatus) VirtualMachine() *virtv1.VirtualMachine {
-	return vms.vm
+// Memory allocation safe. refer the virtual machine information with workload metadata.
+// if workload metadata associated VirtualMachineInfo does not exist, create a new VirtualMachineInfo
+// and return it.
+func (list VirtualMachineInfoList) referVirtualMachineInfo(meta *kauloud.WorkloadMeta) *VirtualMachineInfo {
+	if _, ok := list[meta.Owner]; !ok {
+		list[meta.Owner] = make(map[kauloud.UUID]*VirtualMachineInfo)
+	}
+	if _, ok := list[meta.Owner][meta.UUID]; !ok {
+		list[meta.Owner][meta.UUID] = NewVirtualMachineInfo(meta)
+	}
+	return list[meta.Owner][meta.UUID]
 }
 
-func (vms *VirtualMachineStatus) String() string{
-	return fmt.Sprintf("%s :: isReady (%v), IsProgress(%s), isRunning(%v)", vms.VirtualMachine().Name, vms.IsReady(), vms.Progress(), vms.IsRunning())
+// Delete workload metadata associated VirtualMachineInfo, and return deleted target.
+func (list VirtualMachineInfoList) deleteVirtualMachineInfo(meta *kauloud.WorkloadMeta) (*VirtualMachineInfo, error){
+	if _, ok := list[meta.Owner]; !ok {
+		return nil, fmt.Errorf("no matching VirtualMachineInfo")
+	}
+	deleted, ok := list[meta.Owner][meta.UUID];
+	if !ok {
+		return nil, fmt.Errorf("no matching VirtualMachineInfo")
+	}
+	delete(list[meta.Owner], meta.UUID)
+	return deleted, nil
+}
+
+type VirtualMachineInfo struct {
+	Object *VirtualMachineObject
+	Status *pb.VirtualMachineStatus
+}
+
+func NewVirtualMachineInfo (meta *kauloud.WorkloadMeta) *VirtualMachineInfo {
+	return &VirtualMachineInfo{
+		Object: &VirtualMachineObject{
+			vm:         nil,
+			datavolume: nil,
+			clusterIP:  nil,
+		},
+		Status:  &pb.VirtualMachineStatus{
+			IsReady:   false,
+			Progress:  kauloud.None,
+			IsRunning: false,
+			ClusterIp: kauloud.None,
+			UUID:      meta.UUID.String(),
+			Owner:     meta.Owner.String(),
+		},
+	}
+}
+
+func (info *VirtualMachineInfo) updateStatOnVirtualMachineUpdate() {
+	if info.Object.VirtualMachine() == nil {
+		return
+	}
+	info.Status.IsRunning = info.Object.VirtualMachine().Status.Created
+}
+
+func (info *VirtualMachineInfo) updateStatOnDataVolumeUpdate() {
+	if info.Object.DataVolume() == nil {
+		return
+	}
+	if info.Object.DataVolume().Status.Phase == cdiv1.Succeeded {
+		info.Status.IsReady = true
+	} else {
+		info.Status.IsReady = false
+	}
+	info.Status.Progress = string(info.Object.DataVolume().Status.Progress)
+}
+
+func (info *VirtualMachineInfo) updateStatOnClusterIPServiceUpdate() {
+	if info.Object.ClusterIPService() == nil {
+		return
+	}
+	info.Status.ClusterIp = info.Object.ClusterIPService().Spec.ClusterIP
+}
+
+func (info *VirtualMachineInfo) updateStatOnVirtualMachineDeletion() {
+	/* info.vm = nil
+	info.datavolume = nil
+	info.clusterIP = nil */
+	info.Object = nil
+	info.Status = nil
+}
+
+func (info *VirtualMachineInfo) updateStatOnDataVolumeDeletion() {
+	if info.Status == nil {
+		return
+	}
+	info.Status.IsReady = false
+	info.Status.Progress = kauloud.DataVolumeDeleted
+}
+
+func (info *VirtualMachineInfo) updateStatOnClusterIPServiceDeletion() {
+	if info.Status == nil {
+		return
+	}
+	info.Status.ClusterIp = kauloud.None
+}
+
+type VirtualMachineObject struct {
+	vm			*virtv1.VirtualMachine
+	datavolume	*cdiv1.DataVolume
+	clusterIP	*corev1.Service
+}
+
+func (o *VirtualMachineObject) VirtualMachine() *virtv1.VirtualMachine {
+	return o.vm
+}
+func (o *VirtualMachineObject) DataVolume() *cdiv1.DataVolume {
+	return o.datavolume
+}
+func (o *VirtualMachineObject) ClusterIPService() *corev1.Service {
+	return o.clusterIP
+}
+func (o *VirtualMachineObject) SetVirtualMachine(vm *virtv1.VirtualMachine) {
+	o.vm = vm
+}
+func (o *VirtualMachineObject) SetDataVolume(datavolume *cdiv1.DataVolume) {
+	o.datavolume = datavolume
+}
+func (o *VirtualMachineObject) SetClusterIPService(clusterIP *corev1.Service) {
+	o.clusterIP = clusterIP
 }

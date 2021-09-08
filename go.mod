@@ -8,7 +8,7 @@ replace (
 	github.com/openshift/api => github.com/openshift/api v0.0.0-20191219222812-2987a591a72c
 	github.com/openshift/client-go => github.com/openshift/client-go v0.0.0-20191125132246-f6563a70e19a
 	github.com/operator-framework/operator-lifecycle-manager => github.com/operator-framework/operator-lifecycle-manager v0.0.0-20190128024246-5eb7ae5bdb7a
-	//github.com/xjayleex/kauloud => ./
+	// github.com/xjayleex/kauloud => ./
 	k8s.io/api => k8s.io/api v0.16.4
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.16.4
 	k8s.io/apimachinery => k8s.io/apimachinery v0.16.4

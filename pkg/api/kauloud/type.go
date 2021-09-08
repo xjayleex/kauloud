@@ -20,16 +20,6 @@ type Resources struct {
 	Gpu	Gpu
 }
 
-// should be deprecated.
-func NewResources (cpu string, memory string, gpu Gpu) *Resources {
-	return &Resources{
-		// Todo :: Think about how to inject gpu.
-		Cpu: cpu,
-		Memory: memory,
-		Gpu: gpu,
-	}
-}
-
 func NewResourceFromSetter(setter ResourceSetter) *Resources {
 	return &Resources{
 		Cpu: setter.Cpu(),
@@ -66,4 +56,22 @@ func (r *Resources) ParseResourceList () (corev1.ResourceList, error) {
 type Gpu struct {
 	Enabled    bool
 	DeviceName string
+}
+
+type UUID string
+
+func (u *UUID) String() string {
+	return string(*u)
+}
+
+type UserID string
+
+func (u *UserID) String() string {
+	return string(*u)
+}
+
+// Store workload metadata, owner and uuid.
+type WorkloadMeta struct {
+	Owner UserID
+	UUID  UUID
 }

@@ -6,9 +6,14 @@ import (
 )
 
 var  (
-	ErrorTypeAssertionForPod = Error{ msg : "error on type assertion for pod" }
-	ErrorTypeAssertionForNode = Error{ msg : "error on type assertion for node" }
-	ErrorPodPendingWithNoNode = Error{ msg : "pod is pending with no node name" }
+	ErrorTypeAssertionForVM          = Error{ msg : "error on type assertion for vm" }
+	ErrorTypeAssertionForPod         = Error{ msg : "error on type assertion for pod" }
+	ErrorTypeAssertionForNode        = Error{ msg : "error on type assertion for node" }
+	ErrorTypeAssertionForService     = Error{ msg : "error on type assertion for service"}
+	ErrorTypeAssertionForDatavolume  = Error{ msg : "error on type assertion for datavolume"}
+	ErrorPodPendingWithNoNode        = Error{ msg : "pod is pending with no node name" }
+	ErrorResourceDescriberNotRunning = Error{ msg :"describer not running" }
+	ErrorParsingResourceList         = Error{ msg : "can not parsing resource list" }
 )
 
 type Error struct {

@@ -1,27 +1,34 @@
-package main
+package auth
 
 import (
-	"github.com/go-redis/redis/v8"
+	_ "github.com/go-sql-driver/mysql"
 	pb "github.com/xjayleex/kauloud/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 	"time"
 )
 
-func main() {
+func test() {
 
 	expires := time.Second * 3600
 	secretKeyMustBeFromFile := "secret"
-	rs, err := NewRedisUserStore(&redis.Options{
+	/* rs, err := NewRedisUserStore(&redis.Options{
 		Addr:               "localhost:6379",
 		DB:                 4,
 	})
 
 	if err != nil {
 		panic(err)
+	} */
+	rdb, err := NewMysqlGdbc(NewMysqlDataSourceName(
+		"root", "start130625", "", "localhost", "3306", "testdb"))
+	if err != nil {
+		panic(err)
 	}
-	NewJWTManager(secretKeyMustBeFromFile,expires)
-	auth := NewAuthServer(rs, NewJWTManager(secretKeyMustBeFromFile,expires))
+	cs := NewCandidateStore(rdb)
+
+	rdbus := NewRDBUserStore(rdb)
+	auth := NewAuthServer(cs,rdbus, NewJWTManager(secretKeyMustBeFromFile,expires))
 	auth.SetUpDevLogger()
 	authGRPC := NewAuthGRPC(grpc.NewServer(grpc.UnaryInterceptor(auth.verifyTokenInterceptor)), auth)
 	pb.RegisterAuthServiceServer(authGRPC.Server, authGRPC)

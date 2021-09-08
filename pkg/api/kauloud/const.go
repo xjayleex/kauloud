@@ -4,18 +4,18 @@ import corev1 "k8s.io/api/core/v1"
 
 const (
 	// Label assets
-	LabelKeyKauloudUserId    = "kauloud/userid"
+	LabelKeyKauloudUserID    = "kauloud/userid"
 	LabelKeyKauloudDvType    = "kauloud/dvtype"
 	LabelKeyKauloudImageCode = "kauloud/imagecode"
 	LabelKeyKauloudUUID      = "kauloud/uuid"
 
-	LabelValueKauloudDvTypeBaseImage = "base-image"
-	LabelValueKauloudDvTypeVmImage = "vm-image"
+	LabelValueKauloudDvTypeBaseImage   = "base-image"
+	LabelValueKauloudDvTypeUserVmImage = "vm-image"
 
 	// Annotation assets
 	AnnotationKeyOsType = "OsType"
 	AnnotationKeyOsVersion = "OsVersion"
-	AnnotationKeyImageSize = "ImageSize"
+	AnnotationKeyImageSize = "Size"
 
 	PrefixNameDataVolume = "dv"
 	PrefixNameVirtualMachine = "vm"
@@ -38,4 +38,13 @@ const (
 	TargetNamespace      = corev1.NamespaceDefault
 	AllNamespace = corev1.NamespaceAll
 	DataVolumeSucceed    = "Succeeded"
+	DataVolumeDeleted	 = "DataVolumeDeleted"
+	None = "None"
+
+	DefaultInformerThreadiness = 1
+
+	NodePortServiceType = "NodePort"
+	ClusterIPServiceType = "ClusterIP"
+
+	AnonymousUser = "Anonymous"
 )

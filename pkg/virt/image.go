@@ -9,29 +9,29 @@ import (
 	cdiv1alpha1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 )
 type VmCreationTemplate struct {
-	UserId    string
-	ImageCode VmImageCode
+	UserID    string
+	ImageCode VirtualMachineImageCode
 	Resources kauloud.Resources
 }
 
 type ParsedVmCreationTemplate struct {
 	*VmCreationTemplate
 	*BaseImageMeta
-	UUID uuid.UUID
+	UUID               uuid.UUID
 }
 
 type BaseImageMeta struct{
-	ImageName   string
-	ImageOsMeta *ImageOsMeta
-	ImageSize   resource.Quantity
+	Name   string
+	OsMeta *ImageOsMeta
+	Size   resource.Quantity
 }
 
-func GetBaseImageMeta(dv *cdiv1alpha1.DataVolume) *BaseImageMeta {
-	quantity, _ := dv.Spec.PVC.Resources.Requests[corev1.ResourceStorage]
+func GetBaseImageMeta(datavolume *cdiv1alpha1.DataVolume) *BaseImageMeta {
+	quantity, _ := datavolume.Spec.PVC.Resources.Requests[corev1.ResourceStorage]
 	return &BaseImageMeta{
-		ImageName:   dv.Name,
-		ImageOsMeta: GetImageOsMetaFromAnnotation(dv.GetAnnotations()),
-		ImageSize:   quantity,
+		Name:   datavolume.Name,
+		OsMeta: GetImageOsMetaFromAnnotation(datavolume.GetAnnotations()),
+		Size:   quantity,
 	}
 }
 
@@ -61,8 +61,27 @@ func (o *ImageOsMeta) String() string {
 	return fmt.Sprintf("%s-%s", o.OsType, o.OsVersion)
 }
 
-type VmImageCode string
+type VirtualMachineImageCode string
 
-func (s VmImageCode) String () string {
+func (s VirtualMachineImageCode) String () string {
 	return string(s)
 }
+
+// Instance Type
+
+type InstanceType struct {
+	Code		InstanceTypeCode
+	Name 		INstanceTypeName
+	Resources	kauloud.Resources
+}
+
+func (t *InstanceType) IsValid() bool {
+	if t.Code <= 0 || t.Name == "" {
+		return false
+	}
+	// Todo :: InstanceType.Resource Validation
+	return true
+}
+
+type InstanceTypeCode int32
+type INstanceTypeName string

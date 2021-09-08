@@ -18,7 +18,8 @@ func main() {
 		panic(err)
 	}
 
-	describer := informer.NewPollingResourceDescriber(clientset, logger)
+	describer := informer.NewStreamingResourceDescriber(clientset, logger)
+
 	stop := make(chan struct{})
 	defer close(stop)
 	describer.Run(1, stop)

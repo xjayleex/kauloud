@@ -2,70 +2,65 @@ package virt
 
 import (
 	"errors"
-	"fmt"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/xjayleex/kauloud/pkg/api/kauloud"
 	"github.com/xjayleex/kauloud/pkg/utils"
+	pb "github.com/xjayleex/kauloud/proto"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	virtv1 "kubevirt.io/client-go/api/v1"
 	cdiclient "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned"
-	cdiv1alpha1core "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned/typed/core/v1alpha1"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1alpha1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 )
 
-type VirtManager struct {
-	config      *utils.KauloudConfig
-	logger *logrus.Logger
-
-	virtClient  kubecli.KubevirtClient
-	workloadMgr *VmWorkloadManager
-	imageMgr    *ImageManager
+type Manager struct {
+	config          	*utils.KauloudConfig
+	logger          	*logrus.Logger
+	client          	kubecli.KubevirtClient
+	workloadManager 	*VMWorkloadManager
+	imageManager    	*ImageManager
+	instanceTypeLister	*InstanceTypeLister
 }
 
-func NewVirtManager (config *utils.KauloudConfig, logger *logrus.Logger, virtClient kubecli.KubevirtClient) (*VirtManager, error){
+func NewManager(config *utils.KauloudConfig, logger *logrus.Logger, virtClient kubecli.KubevirtClient) (*Manager, error){
 	// TODO :: Client Config from outside args
-	new := &VirtManager{
+	new := &Manager{
 		config: config,
 		logger: logger,
-		virtClient: virtClient,
+		client: virtClient,
 	}
 
-	imageMgr, err := NewImageManager(new.VirtClient().CdiClient(), config)
-	workloadMgr := NewVmWorkloadManager(new.config)
+	imageManager, err := NewImageManager(logger, new.Client().CdiClient(), config)
+	workloadManager := NewVMWorkloadManager(new.config)
 
-	new.imageMgr = imageMgr
-	new.workloadMgr = workloadMgr
+	new.imageManager = imageManager
+	new.workloadManager = workloadManager
+	new.instanceTypeLister = NewInstanceTypeLister(DefaultInstanceTypes()...)
 
 	return new, err
 }
 
-func (o *VirtManager) Logger() *logrus.Logger {
-	return o.logger
+func (m *Manager) WorkloadManager() *VMWorkloadManager {
+	return m.workloadManager
 }
 
-func (o *VirtManager) VirtClient() kubecli.KubevirtClient {
-	return o.virtClient
+func (m *Manager) ImageManager() *ImageManager {
+	return m.imageManager
 }
 
-func (o *VirtManager) ImageMgr() *ImageManager {
-	return o.imageMgr
+func (m *Manager) Logger() *logrus.Logger {
+	return m.logger
 }
 
-func (o *VirtManager) WorkloadMgr() *VmWorkloadManager {
-	return o.workloadMgr
+func (m *Manager) Client() kubecli.KubevirtClient {
+	return m.client
 }
 
-func (o *VirtManager) ListVmi(namespace string, options *metav1.ListOptions) (*virtv1.VirtualMachineInstanceList, error) {
-	vmiList, err := o.VirtClient().VirtualMachineInstance(namespace).List(options)
-	return vmiList, err
-}
-
-func (o *VirtManager) CreateVmWorkload (req VmCreationTemplate) error {
-	imageMeta, ok := o.ImageMgr().RefBaseImageMetaMap(req.ImageCode)
+func (m *Manager) CreateVirtualMachineWorkload(req VmCreationTemplate) error {
+	imageMeta, ok := m.imageManager.ReferBaseImageMeta(req.ImageCode)
 	if !ok {
 		return errors.New("no matching images")
 	}
@@ -75,175 +70,152 @@ func (o *VirtManager) CreateVmWorkload (req VmCreationTemplate) error {
 		BaseImageMeta:      imageMeta,
 		UUID:               uuid.New(),
 	}
-	workload := o.WorkloadMgr().NewVmWorkload(template)
-	svc, err := o.VirtClient().CoreV1().Services(o.config.VirtManagerConfig.Namespace).Create(workload.Service)
+	workload := m.workloadManager.NewVmWorkload(template)
+	clusterIP, err := m.Client().CoreV1().Services(m.config.VirtManagerConfig.Namespace).Create(workload.ClusterIP)
 	if err != nil {
 		return err
 	}
 
-	_, err = o.VirtClient().VirtualMachine(o.config.VirtManagerConfig.Namespace).Create(workload.VirtualMachine)
+	_, err = m.Client().VirtualMachine(m.config.VirtManagerConfig.Namespace).Create(workload.VM)
 	if err != nil {
-		fmt.Println(err)
-		err = o.VirtClient().CoreV1().Services(o.config.VirtManagerConfig.Namespace).Delete(svc.Name, &metav1.DeleteOptions{})
+		err = m.Client().CoreV1().Services(m.config.VirtManagerConfig.Namespace).Delete(clusterIP.Name, &metav1.DeleteOptions{})
 		return err
 	}
+	return err
+}
+
+func (m *Manager) DeleteVirtualMachineWorkload(meta *pb.WorkloadObjectNameMeta, options *metav1.DeleteOptions) error {
+	// First, we try to delete Services. To do this, we should be able to get Service name by VirtualMachine information.
+	err := m.Client().CoreV1().Services(m.config.VirtManagerConfig.Namespace).Delete(meta.ClusterIp, options)
+	err = m.Client().VirtualMachine(m.config.VirtManagerConfig.Namespace).Delete(meta.VirtualMachine, options)
 	return err
 }
 
 type ImageManager struct {
 	cdiclient.Interface
-	config           *utils.KauloudConfig
-	imageCodes		 []VmImageCode
-	baseImageMetaMap map[VmImageCode]*BaseImageMeta
+	logger			*logrus.Logger
+	config			*utils.KauloudConfig
+	baseImageMetaList map[VirtualMachineImageCode]*BaseImageMeta
 }
 
-func NewImageManager (cdiclient cdiclient.Interface, config *utils.KauloudConfig) (*ImageManager, error) {
-	imageMgr := &ImageManager{
+func NewImageManager (logger *logrus.Logger, cdiclient cdiclient.Interface, config *utils.KauloudConfig) (*ImageManager, error) {
+	new := &ImageManager{
+		logger: logger,
 		Interface: cdiclient,
 		config:    config,
 	}
 
-	err := imageMgr.loadBaseImageMeta()
+	err := new.loadBaseImageMetaList()
 
-	return imageMgr, err
+	return new, err
 }
 
-func (o *ImageManager) loadBaseImageMeta() error {
-	baseImageMap := map[VmImageCode]*BaseImageMeta{}
-	baseImages, err := o.baseImages()
+// Initialize BaseImageMetaList.
+// Firstly, get DataVolume list from api server.
+// And, check DataVolume's annotation with kauloud.LabelKeyKauloudImageCode for each item.
+// If not exist, just skip.
+// Then, check original BaseImageMetaList if the ImageCode is existing already.
+// If not exist, store new BaseImageMeta gotten from the DataVolume's annotations.
+func (m *ImageManager) loadBaseImageMetaList() error {
+	m.baseImageMetaList = make(map[VirtualMachineImageCode]*BaseImageMeta)
+	dvTypeLabel := map[string]string {
+		kauloud.LabelKeyKauloudDvType: kauloud.LabelValueKauloudDvTypeBaseImage,
+	}
+	baseImages, err := m.listDataVolumeByLabel(dvTypeLabel)
 	if err != nil {
 		return err
 	}
-	for _, e := range baseImages.Items {
-		baseImageMap[VmImageCode(e.Labels[kauloud.LabelKeyKauloudImageCode])] = GetBaseImageMeta(&e)
+	for _, datavolume := range baseImages.Items {
+		// Todo :: Must check it works. I changed ImageCode's store from Labels to Annotations.
+		codeValue, ok := datavolume.Annotations[kauloud.LabelKeyKauloudImageCode]
+		if !ok {
+			continue
+		}
+		imageCode := VirtualMachineImageCode(codeValue)
+		_, exists := m.ReferBaseImageMeta(imageCode)
+		if exists {
+			m.logger.Warnf("Identical existing for ImageCode (%s)\n Skipping later one...", imageCode)
+			continue
+		}
+		m.baseImageMetaList[imageCode] = GetBaseImageMeta(&datavolume)
 	}
-	o.baseImageMetaMap = baseImageMap
-	return err
+	return nil
 }
 
-func (o *ImageManager) RefBaseImageMetaMap(code VmImageCode) (*BaseImageMeta, bool) {
-	baseImageMeta, ok := o.baseImageMetaMap[code]
+// This function can be used by gRPC call with update on DataVolume.
+func (m *ImageManager) UpdateBaseImageList() error {
+	return nil
+}
+
+// Refer BaseImageMeta with ImageCode.
+func (m *ImageManager) ReferBaseImageMeta(imageCode VirtualMachineImageCode) (*BaseImageMeta, bool) {
+	baseImageMeta, ok := m.baseImageMetaList[imageCode]
 	return baseImageMeta, ok
 }
 
-func (o *ImageManager) ListDataVolume(namespace string, options metav1.ListOptions) (*cdiv1alpha1.DataVolumeList, error) {
-	dvList, err := o.CdiV1alpha1().DataVolumes(namespace).List(options)
-	return dvList, err
+func (m *ImageManager) listDataVolumeByLabel(label map[string]string) (*cdiv1alpha1.DataVolumeList, error) {
+	options := utils.GetListOptionsWithLabel(label)
+	return m.CdiV1alpha1().DataVolumes(corev1.NamespaceAll).List(options)
 }
 
-func (o *ImageManager) ListDataVolumesByLabel(namespace string, labelSet map[string]string)  (*cdiv1alpha1.DataVolumeList, error) {
-	listOptions := utils.GetListOptionsWithLabel(labelSet)
-	dvList, err := o.ListDataVolume(namespace, listOptions)
-	return dvList, err
-}
-
-func (o *ImageManager) baseImageDataVolume() cdiv1alpha1core.DataVolumeInterface {
-	return o.CdiV1alpha1().DataVolumes(o.config.VirtManagerConfig.BaseImageNamespace)
-}
-
-func (o *ImageManager) ListBaseImageDataVolume(options metav1.ListOptions) (*cdiv1alpha1.DataVolumeList, error) {
-	return o.baseImageDataVolume().List(options)
-}
-
-func (o *ImageManager) ListBaseImageDataVolumeByLabel (labelSet map[string]string) (*cdiv1alpha1.DataVolumeList, error) {
-	listOptions := getListOptionsWithLabel(labelSet)
-	return o.baseImageDataVolume().List(listOptions)
-}
-
-func (o *ImageManager) baseImages() (*cdiv1alpha1.DataVolumeList, error){
-	labelSet := map[string]string {
-		kauloud.LabelKeyKauloudDvType: kauloud.LabelValueKauloudDvTypeBaseImage,
-	}
-	return o.ListBaseImageDataVolumeByLabel(labelSet)
-}
-
-func (o *ImageManager) baseImagesByImageCode(code VmImageCode) (*cdiv1alpha1.DataVolume, error) {
-	labelSet := map[string]string {
-		kauloud.LabelKeyKauloudDvType: kauloud.LabelValueKauloudDvTypeBaseImage,
-		kauloud.LabelKeyKauloudImageCode: code.String(),
-	}
-	dvList, err := o.ListBaseImageDataVolumeByLabel(labelSet)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if len(dvList.Items) <= 0 {
-		return nil, errors.New("no matching base image")
-	} else if len(dvList.Items) > 1 {
-		return nil, errors.New("no unique base image")
-	}
-
-	return &dvList.Items[0], nil
-}
-
-func (o *ImageManager) getBaseImageAnnotation(code VmImageCode) (map[string]string, error) {
-	if dv, err := o.baseImagesByImageCode(code); err != nil {
-		return nil, err
-	} else {
-		return dv.Annotations, err
-	}
-}
-
-func (o *ImageManager) UpdatedBaseImageMeta(code VmImageCode) (*ImageOsMeta, error) {
-	annotation, err := o.getBaseImageAnnotation(code)
-	if err != nil {
-		return nil, err
-	}
-	imageMeta := GetImageOsMetaFromAnnotation(annotation)
-	return imageMeta, nil
-}
-
-type VmWorkloadManager struct {
-	vmPreset *defaultVirtualMachine
+type VMWorkloadManager struct {
+	preset *defaultVirtualMachine
 	config *utils.KauloudConfig
 }
 
-func NewVmWorkloadManager(config *utils.KauloudConfig) *VmWorkloadManager {
-	vmPreset := DefaultVirtualMachine(ParseDefaultVmOptions(config))
-	return &VmWorkloadManager{
-		vmPreset: vmPreset,
-		config:   config,
+func NewVMWorkloadManager(config *utils.KauloudConfig) *VMWorkloadManager {
+	preset := DefaultVirtualMachine(ParseDefaultVmOptions(config))
+	return &VMWorkloadManager{
+		preset: preset,
+		config: config,
 	}
 }
 
-func (o *VmWorkloadManager) VmPreset() *defaultVirtualMachine {
-	return o.vmPreset
+func (o *VMWorkloadManager) PresetVirtualMachine() *defaultVirtualMachine {
+	return o.preset
 }
 
-func (o *VmWorkloadManager) NewVmWorkload(template *ParsedVmCreationTemplate) *VmWorkload {
-	new := &VmWorkload{
-		VirtualMachine: o.newVmObject(template),
-		Service:        nil,
+func (o *VMWorkloadManager) NewVmWorkload(template *ParsedVmCreationTemplate) *VirtualMachineWorkload {
+	new := &VirtualMachineWorkload{
+		VM:       o.NewVirtualMachineObject(template),
+		NodePort: nil,
 	}
-	new.attachService()
+	new.attachServices()
 	return new
 }
 
-func (o *VmWorkloadManager) newVmObject(template *ParsedVmCreationTemplate) *virtv1.VirtualMachine {
+func (o *VMWorkloadManager) NewVirtualMachineObject(template *ParsedVmCreationTemplate) *virtv1.VirtualMachine {
 	must := map[string]string {
-		kauloud.LabelKeyKauloudUserId:    template.UserId,
+		kauloud.LabelKeyKauloudUserID:    template.UserID,
 		kauloud.LabelKeyKauloudImageCode: template.ImageCode.String(),
 		kauloud.LabelKeyKauloudUUID:      template.UUID.String(),
 	}
-	builder := o.VmPreset().GetNewVmBuilder()
-
+	builder := o.PresetVirtualMachine().GetVirtualMachineBuilder()
 	return builder.Config(o.config).Template(template).Labels(must).Build()
 }
 
-type VmWorkload struct {
-	*virtv1.VirtualMachine
-	*corev1.Service
+type VirtualMachineWorkload struct {
+	VM        *virtv1.VirtualMachine
+	NodePort  *corev1.Service
+	ClusterIP *corev1.Service
 }
 
-func (o *VmWorkload) attachService(additional ...corev1.ServicePort) (*VmWorkload, error) {
-	// TODO : Vm 생성 & Svc 생성
-	vmUUID, ok := o.VirtualMachine.Labels[kauloud.LabelKeyKauloudUUID]
+func (o *VirtualMachineWorkload) attachServices() error {
+	if o.VM == nil || o.VM.Labels == nil {
+		return errors.New("VirtualMachineWorkload object is nil or Labels are not initialized")
+	}
+	userid, ok := o.VM.Labels[kauloud.LabelKeyKauloudUserID]
 	if !ok {
-		return nil, errors.New("no matching vm UUID")
+		return errors.New("no matching label key for kauloud.LabelKeyKauloudUserID")
+	}
+
+	uuid, ok := o.VM.Labels[kauloud.LabelKeyKauloudUUID]
+	if !ok {
+		return errors.New("no matching label key for kauloud.LabelKeyKauloudUUID")
 	}
 	serviceLabel := map[string]string{
-		kauloud.LabelKeyKauloudUUID: vmUUID,
+		kauloud.LabelKeyKauloudUserID: userid,
+		kauloud.LabelKeyKauloudUUID:   uuid,
 	}
 
 	// set default sshd port
@@ -256,26 +228,137 @@ func (o *VmWorkload) attachService(additional ...corev1.ServicePort) (*VmWorkloa
 		},
 	}
 
-	ports = append(ports, additional...)
-
-	svc := &corev1.Service{
+	o.NodePort = &corev1.Service{
 		TypeMeta:   metav1.TypeMeta{
 			Kind:       "Service",
 			APIVersion: "corev1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:                       fmt.Sprintf("%s-svc", o.VirtualMachine.Name),
-			Namespace:                  o.VirtualMachine.Namespace,
+			Name:                       utils.NameServiceOnKubeResource(o.VM.Name, "NodePort"),
+			Namespace:                  o.VM.Namespace,
+			Labels:						serviceLabel,
 		},
 		Spec:       corev1.ServiceSpec{
 			Ports:                    ports,
 			Selector:                 serviceLabel,
-			Type:                     "NodePort",
+			Type:                     kauloud.NodePortServiceType,
 		},
 		Status: corev1.ServiceStatus{},
 	}
 
-	o.Service = svc
-	return o, nil
+	o.ClusterIP = &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{
+			Kind: "Service",
+			APIVersion: "corev1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       utils.NameServiceOnKubeResource(o.VM.Name, "ClusterIP"),
+			Namespace:                  o.VM.Namespace,
+			Labels:                     serviceLabel,
+		},
+		Spec:       corev1.ServiceSpec{
+			Ports:                    ports,
+			Selector:                 serviceLabel,
+			Type:                     kauloud.ClusterIPServiceType,
+		},
+		Status:     corev1.ServiceStatus{},
+	}
+	return nil
 }
 
+type InstanceTypeLister struct {
+	InstanceTypeList map[InstanceTypeCode]InstanceType
+}
+
+func NewInstanceTypeLister(defaults ...InstanceType) *InstanceTypeLister {
+	list := make(map[InstanceTypeCode]InstanceType)
+	new := &InstanceTypeLister{
+		InstanceTypeList: list,
+	}
+	new.init(defaults...)
+	return new
+}
+
+func (o *InstanceTypeLister) init(defaults ...InstanceType) {
+	for _, instance := range defaults {
+		o.InstanceTypeList[instance.Code] = instance
+	}
+}
+
+func (o *InstanceTypeLister) AddInstanceType(new InstanceType) error {
+	if !new.IsValid() {
+		return errors.New("")
+	}
+	o.InstanceTypeList[new.Code] = new
+	return nil
+}
+
+func (o *InstanceTypeLister) DeleteInstanceType(code InstanceTypeCode) {
+	delete(o.InstanceTypeList, code)
+}
+
+func (o *InstanceTypeLister) GetInstanceType(code InstanceTypeCode) (InstanceType, bool) {
+	instanceType, exists := o.InstanceTypeList[code]
+	return instanceType, exists
+}
+
+func DefaultInstanceTypes () []InstanceType {
+
+
+	micro := InstanceType{
+		Code:      1 ,
+		Name:      "InstanceType-CPU-Micro",
+		Resources: kauloud.Resources{
+			Cpu:    "1",
+			Memory: "2Gi",
+			Gpu:    kauloud.Gpu{
+				Enabled:    false,
+				DeviceName: "",
+			},
+		},
+	}
+
+	c24 := InstanceType{
+		Code:      2 ,
+		Name:      "InstanceType-CPU-c24",
+		Resources: kauloud.Resources{
+			Cpu:    "2",
+			Memory: "4Gi",
+			Gpu:    kauloud.Gpu{
+				Enabled:    false,
+				DeviceName: "",
+			},
+		},
+	}
+
+	c48 := InstanceType{
+		Code:      3 ,
+		Name:      "InstanceType-CPU-c48",
+		Resources: kauloud.Resources{
+			Cpu:    "4",
+			Memory: "8Gi",
+			Gpu:    kauloud.Gpu{
+				Enabled:    false,
+				DeviceName: "",
+			},
+		},
+	}
+
+	g48 := InstanceType{
+		Code:      4 ,
+		Name:      "InstanceType-GPU-g48",
+		Resources: kauloud.Resources{
+			Cpu:    "4",
+			Memory: "8Gi",
+			Gpu:    kauloud.Gpu{
+				Enabled:    true,
+			},
+		},
+	}
+
+	defaults := []InstanceType{
+		micro, c24, c48, g48,
+	}
+
+	return defaults
+}

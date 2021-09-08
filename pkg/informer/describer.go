@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/xjayleex/kauloud/pkg/api/kauloud"
+	"github.com/xjayleex/kauloud/pkg/utils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -16,31 +17,36 @@ import (
 )
 
 type ResourceDescriberInterface interface {
-	IsAllocatable(interface{}) bool
+	IsAllocatable(requests corev1.ResourceList) bool
+	IsRunning() bool
 	Run(int, chan struct{})
 }
 
-type PollingResourceDescriber struct {
-	clientset *kubernetes.Clientset
-	logger *logrus.Logger
+type StreamingResourceDescriber struct {
+	config			*utils.KauloudConfig
+	clientset 		*kubernetes.Clientset
+	logger			*logrus.Logger
+	running			bool
 
-	requests    *ResourceMap
-	limits      *ResourceMap
-	allocatable *ResourceMap
+	requests   		*ResourceMap
+	limits     		*ResourceMap
+	allocatable	 	*ResourceMap
 
-	nodeList map[string]*corev1.Node
-	podList map[string]*corev1.Pod
+	nodeList 		map[string]*corev1.Node
+	podList			map[string]*corev1.Pod
 
-	podInformer cache.SharedInformer
-	nodeInformer cache.SharedInformer
+	podInformer		cache.SharedInformer
+	nodeInformer	cache.SharedInformer
 
-	Queue workqueue.RateLimitingInterface
+	Queue			workqueue.RateLimitingInterface
 }
 
-func NewPollingResourceDescriber (clientset *kubernetes.Clientset, logger *logrus.Logger) *PollingResourceDescriber {
-	new := &PollingResourceDescriber{
+func NewStreamingResourceDescriber(config *utils.KauloudConfig, clientset *kubernetes.Clientset, logger *logrus.Logger) *StreamingResourceDescriber {
+	new := &StreamingResourceDescriber{
+		config: 	 config,
 		clientset:   clientset,
 		logger:      logger,
+		running: false,
 		requests:    NewResourceMap(),
 		limits:      NewResourceMap(),
 		allocatable: NewResourceMap(),
@@ -67,7 +73,7 @@ func NewPollingResourceDescriber (clientset *kubernetes.Clientset, logger *logru
 	return new
 }
 
-func (o *PollingResourceDescriber) IsAllocatable(requests corev1.ResourceList) bool {
+func (o *StreamingResourceDescriber) CheckAvailability(requests corev1.ResourceList) bool {
 	for nodeName, _ := range o.nodeList {
 		// if expectedAfterAlloc << o.allocatable -> return true
 		// Todo or not :: node condition Ready Check
@@ -84,13 +90,19 @@ func (o *PollingResourceDescriber) IsAllocatable(requests corev1.ResourceList) b
 	return false
 }
 
-func (o *PollingResourceDescriber) isExpectedEnough (nodeName string, expected corev1.ResourceList) bool {
+func (o *StreamingResourceDescriber) isExpectedEnough (nodeName string, expected corev1.ResourceList) bool {
 	if o.nodeList[nodeName] == nil {
 		return false
 	}
 	nodeAllocatable, err := o.allocatable.RefNodeResourceList(nodeName)
 	if err != nil {
 		return false
+	}
+
+	// `cpu` is compressible resource. We can avoid checking cpu overcommit.
+	// Reference. https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/resource-qos.md#incompressible-resource-guarantees
+	if o.config.ResourceDescriber.SkipCompressibleResource {
+		delete(expected, corev1.ResourceName("cpu"))
 	}
 
 	for resourceName, quantity := range expected {
@@ -105,7 +117,7 @@ func (o *PollingResourceDescriber) isExpectedEnough (nodeName string, expected c
 	return true
 }
 
-func (o *PollingResourceDescriber) Run(threadiness int, stopCh chan struct{}) {
+func (o *StreamingResourceDescriber) Run(threadiness int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 	defer o.Queue.ShutDown()
 	o.logger.Infoln("Starting Cluster Resource Describer.")
@@ -122,60 +134,66 @@ func (o *PollingResourceDescriber) Run(threadiness int, stopCh chan struct{}) {
 		o.logger.Info("Run watch dogs for polling resource describer.")
 		go wait.Until(o.runWorker, time.Second, stopCh)
 	}
+	o.running = true
+	defer func() {o.running = false}()
 	<-stopCh
 	o.logger.Infoln("Stopping describer.")
 }
 
-func (o *PollingResourceDescriber) runWorker() {
+func (o *StreamingResourceDescriber) IsRunning() bool {
+	return o.running
+}
+
+func (o *StreamingResourceDescriber) runWorker() {
 	for o.consume() {}
 }
 
-func (o *PollingResourceDescriber) consume() bool {
+func (o *StreamingResourceDescriber) consume() bool {
 	key, quit := o.Queue.Get()
 	if quit {
 		return false
 	}
 	defer o.Queue.Done(key)
 
-	err := o.sync(key.(EventKey))
+	err := o.sync(key.(Event))
 	o.handleError(err, key)
 	return true
 }
 
-func (o *PollingResourceDescriber) sync(eventKey EventKey) error {
+func (o *StreamingResourceDescriber) sync(event Event) error {
 	var object interface{}
 	var exists bool
 	var err error
 
-	switch eventKey.resource {
+	switch event.resource {
 	case kauloud.ResourceAbbrPod:
-		object, exists, err = o.podInformer.GetStore().GetByKey(eventKey.key.(string))
+		object, exists, err = o.podInformer.GetStore().GetByKey(event.key.(string))
 	case kauloud.ResourceAbbrNode:
-		object, exists, err = o.nodeInformer.GetStore().GetByKey(eventKey.key.(string))
+		object, exists, err = o.nodeInformer.GetStore().GetByKey(event.key.(string))
 	}
 
 	if err != nil {
-		o.logger.Infof("error fetching object from index for the specified key. %s %v", eventKey.key.(string), err)
+		o.logger.Infof("error fetching object from index for the specified key. %s %v", event.key.(string), err)
 		return err
 	}
 
 	if !exists {
-		err := o.deleteHandler(object, &eventKey)
+		err := o.deleteHandler(object, &event)
 		return err
 	}
 
-	if eventKey.verb == kauloud.WatcherEventVerbAdd {
-		err = o.addHandler(object, &eventKey)
+	if event.verb == kauloud.WatcherEventVerbAdd {
+		err = o.addHandler(object, &event)
 	} else { // "update"
-		err = o.updateHandler(object, &eventKey)
+		err = o.updateHandler(object, &event)
 	}
 
 	return err
 }
 
-func (o *PollingResourceDescriber) addHandler(object interface{}, eventKey *EventKey) (err error) {
-	o.logger.Debugf("Add received for %s", eventKey.key.(string))
-	switch eventKey.resource {
+func (o *StreamingResourceDescriber) addHandler(object interface{}, event *Event) (err error) {
+	o.logger.Debugf("Add received for %s", event.key.(string))
+	switch event.resource {
 	case kauloud.ResourceAbbrPod:
 		err = o.handlePodAddition(object)
 	case kauloud.ResourceAbbrNode:
@@ -184,18 +202,20 @@ func (o *PollingResourceDescriber) addHandler(object interface{}, eventKey *Even
 	return err
 }
 
-func (o *PollingResourceDescriber) deleteHandler(object interface{}, eventKey *EventKey) (err error) {
-	o.logger.Debugf("Delete received for %s", eventKey.key.(string))
-	switch eventKey.resource {
+func (o *StreamingResourceDescriber) deleteHandler(object interface{}, event *Event) (err error) {
+	o.logger.Debugf("Delete received for %s", event.key.(string))
+	switch event.resource {
 	case kauloud.ResourceAbbrPod:
-		err = o.handlePodDeletion(object, eventKey)
+		err = o.handlePodDeletion(object, event)
+	case kauloud.ResourceAbbrNode:
+		err = o.handleNodeDeletion(object, event)
 	}
 	return err
 }
 
-func (o *PollingResourceDescriber) updateHandler(object interface{}, eventKey *EventKey) (err error) {
-	o.logger.Debugf("Update received for %s", eventKey.key.(string))
-	switch eventKey.resource {
+func (o *StreamingResourceDescriber) updateHandler(object interface{}, event *Event) (err error) {
+	o.logger.Debugf("Update received for %s", event.key.(string))
+	switch event.resource {
 	case kauloud.ResourceAbbrPod:
 		err = o.handlePodUpdate(object)
 	case kauloud.ResourceAbbrNode:
@@ -204,7 +224,7 @@ func (o *PollingResourceDescriber) updateHandler(object interface{}, eventKey *E
 	return err
 }
 
-func (o *PollingResourceDescriber) handlePodAddition (object interface{}) error {
+func (o *StreamingResourceDescriber) handlePodAddition (object interface{}) error {
 	pod, ok := object.(*corev1.Pod)
 	if !ok {
 		return kauloud.ErrorTypeAssertionForPod
@@ -226,13 +246,13 @@ func (o *PollingResourceDescriber) handlePodAddition (object interface{}) error 
 	return nil
 }
 
-func (o *PollingResourceDescriber) handlePodDeletion (object interface{}, eventKey *EventKey) error {
+func (o *StreamingResourceDescriber) handlePodDeletion (object interface{}, event *Event) error {
 	var podName string
 	pod, ok := object.(*corev1.Pod)
 	if ok {
 		podName = ConcatenatedPodNameWithNamespace(pod.Namespace, pod.Name)
 	} else {
-		podName = eventKey.key.(string)
+		podName = event.key.(string)
 		pod = o.podList[podName]
 	}
 
@@ -248,7 +268,7 @@ func (o *PollingResourceDescriber) handlePodDeletion (object interface{}, eventK
 	return nil
 }
 
-func (o *PollingResourceDescriber) handlePodUpdate (object interface{}) error {
+func (o *StreamingResourceDescriber) handlePodUpdate (object interface{}) error {
 	pod, ok := object.(*corev1.Pod)
 	if !ok {
 		return kauloud.ErrorTypeAssertionForNode
@@ -271,7 +291,7 @@ func (o *PollingResourceDescriber) handlePodUpdate (object interface{}) error {
 
 // 1. Add Node object to the node list.
 // 2. Add allocatable resource with the node.
-func (o *PollingResourceDescriber) handleNodeAddition (object interface{}) error {
+func (o *StreamingResourceDescriber) handleNodeAddition (object interface{}) error {
 	node, ok := object.(*corev1.Node)
 	if !ok {
 		return kauloud.ErrorTypeAssertionForNode
@@ -284,13 +304,13 @@ func (o *PollingResourceDescriber) handleNodeAddition (object interface{}) error
 
 // 1. Try to delete Node object from node list.
 // 2. Try to delete allocatable resource associated with the node.
-func (o *PollingResourceDescriber) handleNodeDeletion (object interface{}, eventKey *EventKey) error {
+func (o *StreamingResourceDescriber) handleNodeDeletion (object interface{}, event *Event) error {
 	var nodeName string
 	node, ok := object.(*corev1.Node)
 	if ok {
 		nodeName = node.Name
 	} else {
-		nodeName = eventKey.key.(string)
+		nodeName = event.key.(string)
 		if node, ok = o.nodeList[nodeName]; !ok {
 			return errors.New("no node object on nodeList map")
 		}
@@ -305,7 +325,7 @@ func (o *PollingResourceDescriber) handleNodeDeletion (object interface{}, event
 	return nil
 }
 
-func (o *PollingResourceDescriber) handleNodeUpdate (object interface{}) error {
+func (o *StreamingResourceDescriber) handleNodeUpdate (object interface{}) error {
 	node, ok := object.(*corev1.Node)
 	if !ok {
 		return kauloud.ErrorTypeAssertionForNode
@@ -315,7 +335,7 @@ func (o *PollingResourceDescriber) handleNodeUpdate (object interface{}) error {
 	return nil
 }
 
-func (o *PollingResourceDescriber) handleError (err error, key interface{}) {
+func (o *StreamingResourceDescriber) handleError (err error, key interface{}) {
 	if err == nil {
 		o.Queue.Forget(key)
 		return
@@ -332,80 +352,80 @@ func (o *PollingResourceDescriber) handleError (err error, key interface{}) {
 	o.logger.Infof("drop pod out of queue after many retries, %v %v", key, err)
 }
 
-func (o *PollingResourceDescriber) addPod(obj interface{}) {
+func (o *StreamingResourceDescriber) addPod(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) deletePod(obj interface{}) {
+func (o *StreamingResourceDescriber) deletePod(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
 		o.logger.Debugf("deletion key : %s\n",key)
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) updatePod (old interface{}, new interface{}) {
+func (o *StreamingResourceDescriber) updatePod (old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrPod,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) addNode(obj interface{}) {
+func (o *StreamingResourceDescriber) addNode(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrNode,
 			verb: kauloud.WatcherEventVerbAdd,
 			key: key,
 		}
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) deleteNode(obj interface{}) {
+func (o *StreamingResourceDescriber) deleteNode(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrNode,
 			verb: kauloud.WatcherEventVerbDelete,
 			key: key,
 		}
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) updateNode (old interface{}, new interface{}) {
+func (o *StreamingResourceDescriber) updateNode (old interface{}, new interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(new)
 	if err == nil {
-		eventKey := EventKey{
+		event := Event{
 			resource: kauloud.ResourceAbbrNode,
 			verb: kauloud.WatcherEventVerbUpdate,
 			key: key,
 		}
-		o.Queue.Add(eventKey)
+		o.Queue.Add(event)
 	}
 }
 
-func (o *PollingResourceDescriber) runTestLister(stopCh <-chan struct{}) {
+func (o *StreamingResourceDescriber) runTestLister(stopCh <-chan struct{}) {
 	for {
 		time.Sleep(10 * time.Second)
 		if o.podList == nil {

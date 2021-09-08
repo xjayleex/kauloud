@@ -1,4 +1,4 @@
-package tmp
+package deprecated
 
 import (
 	"encoding"

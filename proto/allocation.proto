@@ -7,25 +7,18 @@ service AllocAdmissionService {
   rpc CheckAvailability(WorkloadInfo) returns (Availability);
 }
 
-// As a user view,
 message WorkloadInfo {
   WorkloadType type = 1;
-  string userid = 2;
+  string user_id = 2;
   string token = 3;
   string workload_name = 4;
+  ContainerResourceSpec spec = 5;
 }
 
 enum WorkloadType {
   VirtualMachineType = 0;
   ContainerType = 1;
 }
-
-message AllocRequestDescription {
-  // Todo :: think about the user_id extracted from. from raw request or reference vm's annotations?
-  string user_id = 1;
-  ContainerResourceSpec spec = 2;
-}
-
 
 message ContainerResourceSpec {
   Resources resources = 1;
@@ -36,8 +29,8 @@ message ContainerResourceSpec {
 message Resources {
   string cpu = 1;
   string memory = 2;
-  string ephemeral = 3; //
-  Gpu gpu = 4;
+  Gpu gpu = 3;
+  string ephemeral = 4;
 }
 
 message Gpu {

@@ -11,6 +11,9 @@ import (
 
 
 type KauloudConfig struct {
+	ResourceDescriber struct {
+		SkipCompressibleResource bool `yaml:"skipCompressibleResource"`
+	} `yaml:"resourceDescriber"`
 	VirtManagerConfig struct {
 		GPRC struct {
 			Address string `yaml:"address"`
@@ -34,6 +37,7 @@ type KauloudConfig struct {
 			PresetBaseImageName string `yaml:"presetBaseImageName"`
 			Labels              map[string]string `yaml:"labels"`
 		} `yaml:"vmPreset"`
+		GracePeriodSeconds int `yaml:"gracePeriodSeconds"`
 	} `yaml:"virtManager"`
 }
 

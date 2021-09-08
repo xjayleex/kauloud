@@ -2,8 +2,10 @@ package utils
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/xjayleex/kauloud/pkg/api/kauloud"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,4 +81,42 @@ func NewUniCastMacAddress() string {
 func StringAsUint32(n string) uint32 {
 	integer, _ := strconv.Atoi(n)
 	return uint32(integer)
+}
+
+// do not modify
+func NameServiceOnKubeResource(objectName string, serviceType string) string {
+	return fmt.Sprintf("svc-%s-%s", objectName, serviceType)
+}
+
+// Service name can be populated with splitting service name by '-' delimeter and getting
+// last element of tokenized tokens. It is associated with our mechanism to name the service.
+// Refer the utils.NameServiceOnKubeResource() method.
+func GetServiceTypeFromEventKey(key string) (corev1.ServiceType, error) {
+	tokens := strings.Split(key,"-")
+	serviceType := tokens[len(tokens)-1]
+	switch serviceType {
+	case strings.ToLower(string(corev1.ServiceTypeClusterIP)):
+		return corev1.ServiceTypeClusterIP, nil
+	case strings.ToLower(string(corev1.ServiceTypeNodePort)):
+		return corev1.ServiceTypeNodePort, nil
+	default:
+		return "", errors.New("no matching service types")
+	}
+}
+
+// Extract USERID and UUID of VM from labels. If the entity does not exists in label,
+// we should give it a temporary userid, and we also generate temporary code for uuid.
+func ExtractWorkloadMetaFromLabels(label map[string]string) *kauloud.WorkloadMeta {
+	UserID, ok := label[kauloud.LabelKeyKauloudUserID]
+	if !ok {
+		UserID = kauloud.AnonymousUser
+	}
+	UUID, ok := label[kauloud.LabelKeyKauloudUUID]
+	if !ok {
+		UUID = uuid.New().String()
+	}
+	return &kauloud.WorkloadMeta{
+		Owner: kauloud.UserID(UserID),
+		UUID:  kauloud.UUID(UUID),
+	}
 }

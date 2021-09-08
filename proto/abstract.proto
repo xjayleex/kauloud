@@ -1,0 +1,117 @@
+syntax = "proto3";
+package proto;
+import "google/protobuf/empty.proto";
+
+service WorkloadStatusService {
+  rpc ListAllVirtualMachineStats(google.protobuf.Empty) returns (VirtualMachineStats);
+  rpc ListUserVirtualMachineStats(UserID) returns (VirtualMachineStats);
+  rpc GetWorkloadObjectNameMeta(WorkloadMeta) returns (WorkloadObjectNameMeta);
+  rpc IsAllocatable(WorkloadInfo) returns (DummyResponse);
+}
+
+message UserID {
+  string userid = 1;
+}
+
+message VirtualMachineStats {
+  map<string, VirtualMachineStatus> virtual_machine_status_map = 1;
+}
+
+message VirtualMachineStatus {
+  bool is_ready = 1;
+  string progress = 2;
+  bool is_running = 3;
+  string cluster_ip = 4;
+  string UUID = 5;
+  string owner = 6;
+}
+
+message WorkloadMeta {
+  string owner = 1;
+  string UUID = 2;
+}
+
+message WorkloadObjectNameMeta {
+  string virtual_machine = 1;
+  string cluster_ip = 2;
+}
+
+message DummyResponse {
+  bool ok = 1;
+  string additional = 2;
+}
+message DummyRequest {}
+
+message VirtualMachineSpec {
+  enum Type {
+    CPU = 0;
+    GPU = 1;
+  }
+  int32 cores = 1;
+  int32 memory_in_gb = 2;
+  int32 ephemeral_storage_in_gb = 3;
+  string root_data_volume_size_in_gb = 4;
+  string image = 5;
+  repeated CloudInitUserData cloud_init_user_data = 6;
+}
+
+message CloudInitUserData {
+  string user_id = 1;
+  string password = 2;
+}
+
+message VmCreationRequest {
+  string user_id = 1;
+  VirtualMachineSpec virtual_machine_spec = 2;
+}
+
+message VmDeletionRequest {
+  WorkloadObjectNameMeta name_meta = 1;
+}
+
+service VirtManagementService {
+  rpc CreateVirtualMachine(VmCreationRequest) returns (DummyResponse);
+  rpc DeleteVirtualMachine(VmDeletionRequest) returns (DummyResponse);
+  rpc StartVirtualMachine(DummyRequest) returns (DummyResponse);
+  rpc StopVirtualMachine(DummyRequest) returns (DummyResponse);
+  rpc RestartVirtualMachine(DummyRequest) returns (DummyResponse);
+  rpc ListVirtualMachine(DummyRequest) returns (DummyResponse);
+  rpc ListVirtualMachineInstance(DummyRequest) returns (DummyResponse);
+  rpc ListDataVolume(DummyRequest) returns (DummyResponse);
+}
+
+message WorkloadInfo {
+  WorkloadType type = 1;
+  string user_id = 2;
+  string token = 3;
+  string workload_name = 4;
+  ContainerResourceSpec spec = 5;
+}
+
+enum WorkloadType {
+  VirtualMachineType = 0;
+  ContainerType = 1;
+}
+
+message ContainerResourceSpec {
+  Resources resources = 1;
+  string image_code = 2;
+  repeated HostAlias host_aliases = 3;
+}
+
+message Resources {
+  string cpu = 1;
+  string memory = 2;
+  Gpu gpu = 3;
+  string ephemeral = 4;
+}
+
+message Gpu {
+  bool enabled = 1;
+  string device_name = 2;
+}
+
+message HostAlias {
+  string ip_address = 1;
+  repeated string host_names = 2;
+}

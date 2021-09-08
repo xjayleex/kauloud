@@ -64,7 +64,7 @@ func DefaultVirtualMachine(opts *DefaultVmOptions) *defaultVirtualMachine {
 	return &defaultVirtualMachine{
 		VirtualMachine: &virtv1.VirtualMachine{
 			TypeMeta:   metav1.TypeMeta{
-				Kind:       "VirtualMachine",
+				Kind:       "VM",
 				APIVersion: "kubevirt.io/v1alpha3",
 			},
 			ObjectMeta: metav1.ObjectMeta{
@@ -161,7 +161,7 @@ func DefaultVirtualMachine(opts *DefaultVmOptions) *defaultVirtualMachine {
 	}
 }
 
-func (o *defaultVirtualMachine) GetNewVmBuilder () *virtualMachineBuilder {
+func (o *defaultVirtualMachine) GetVirtualMachineBuilder() *virtualMachineBuilder {
 	new := &virtv1.VirtualMachine{}
 	copier.Copy(new, o.VirtualMachine)
 	return &virtualMachineBuilder{ new: new }
@@ -203,7 +203,7 @@ func (b *virtualMachineBuilder) Build() *virtv1.VirtualMachine {
 	}
 
 	namingFunc := func(prefix string) string{
-		return fmt.Sprintf("%s-%s-%s", prefix, b.template.UserId, utils.GetTimeLowFromUUID(b.template.UUID))
+		return fmt.Sprintf("%s-%s-%s", prefix, b.template.UserID, utils.GetTimeLowFromUUID(b.template.UUID))
 	}
 
 	b.new.ObjectMeta.Name = namingFunc(kauloud.PrefixNameVirtualMachine)
@@ -250,10 +250,13 @@ func (b *virtualMachineBuilder) Build() *virtv1.VirtualMachine {
 		},
 	}
 
+	// labeling datavolume to notify it is for user virtual machine datavolume.
+	b.labels[kauloud.LabelKeyKauloudDvType] = kauloud.LabelValueKauloudDvTypeUserVmImage
 	b.new.Spec.DataVolumeTemplates = []virtv1.DataVolumeTemplateSpec {
 		{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: namingFunc(kauloud.PrefixNameDataVolume),
+				Labels: b.labels,
 			},
 			Spec: cdiv1.DataVolumeSpec{
 				PVC: &corev1.PersistentVolumeClaimSpec{
@@ -261,14 +264,14 @@ func (b *virtualMachineBuilder) Build() *virtv1.VirtualMachine {
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						"ReadWriteOnce",
 					},
-					Resources: utils.GetKubeResourceRequirements(utils.GetStorageResourceList(b.template.ImageSize), utils.GetStorageResourceList("")),
+					Resources: utils.GetKubeResourceRequirements(utils.GetStorageResourceList(b.template.Size), utils.GetStorageResourceList("")),
 					DataSource: &corev1.TypedLocalObjectReference{
 						APIGroup: &nilString,
 					},
 				},
 				Source: cdiv1.DataVolumeSource{
 					PVC: &cdiv1.DataVolumeSourcePVC{
-						Name: b.template.ImageName,
+						Name: b.template.Name,
 						Namespace: b.config.VirtManagerConfig.BaseImageNamespace,
 					},
 				},
